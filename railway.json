@@ -1,0 +1,11 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "RAILPACK"
+  },
+  "deploy": {
+    "startCommand": "python bsc_ido_tg_bot.py",
+    "restartPolicyType": "ALWAYS",
+    "restartPolicyMaxRetries": 10
+  }
+}
