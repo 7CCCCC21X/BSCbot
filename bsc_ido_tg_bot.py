@@ -566,15 +566,18 @@ def _fmt_unix(ts: int) -> str:
     return f"{ts} (UTC+8 {dt_cn:%Y-%m-%d %H:%M:%S}, UTC {dt_utc:%Y-%m-%d %H:%M:%S})"
 
 
-def extract_tx_extra_info(tx_hash: str) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
+def extract_tx_extra_info(
+    tx_hash: str,
+) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[int], List[Tuple[int, str, Optional[str]]]]:
     """
-    返回：token_address, token_name, start_ts, end_ts
+    返回：token_address, token_name, start_ts, end_ts, input_addresses
     说明：从创建交易 input 中启发式提取，适配大多数工厂 create 参数布局。
+    input_addresses: 输入参数中解码出的所有非零地址列表，格式 [(索引, 地址, 名称或None), ...]。
     """
     try:
         tx = w3.eth.get_transaction(tx_hash)
     except Exception:
-        return None, None, None, None
+        return None, None, None, None, []
 
     input_data = tx.get("input", "") if isinstance(tx, dict) else getattr(tx, "input", "")
     tx_from = str(tx.get("from", "")).lower() if isinstance(tx, dict) else str(getattr(tx, "from", "")).lower()
@@ -582,26 +585,36 @@ def extract_tx_extra_info(tx_hash: str) -> Tuple[Optional[str], Optional[str], O
 
     token_address: Optional[str] = None
     token_name: Optional[str] = None
+    input_addresses: List[Tuple[int, str, Optional[str]]] = []
 
     decoded_addrs, decoded_ts = _decode_create_ido_input(input_data)
 
-    # 优先按 createIDO 常见布局取 _addresses[2] 为 sale token
     if decoded_addrs:
-        # 先按固定位置直接取，避免因为 code/name 探测失败导致地址都不显示
-        if len(decoded_addrs) > 2 and decoded_addrs[2].lower() != "0x" + "0" * 40:
-            token_address = decoded_addrs[2]
-            ok, readable_name = _is_probable_erc20(decoded_addrs[2])
-            if ok:
-                token_name = readable_name
-
-        preferred_indexes = [2, 1, 0, 3]
-        for idx in preferred_indexes:
-            if token_address:
-                break
-            if idx >= len(decoded_addrs):
-                continue
-            addr = decoded_addrs[idx]
+        # 遍历所有非零地址，收集详情并寻找代币
+        for i, addr in enumerate(decoded_addrs):
             if addr.lower() == "0x" + "0" * 40:
+                continue
+            ok, readable_name = _is_probable_erc20(addr)
+            if ok:
+                input_addresses.append((i, addr, readable_name))
+                if token_address is None:
+                    token_address = addr
+                    token_name = readable_name
+            else:
+                # 非 ERC20 合约也尝试获取 name() 用于显示
+                name = _call_string_method(addr, _selector("name()"))
+                input_addresses.append((i, addr, name))
+
+        # 如果没找到 ERC20，使用第一个非零地址作为兜底
+        if token_address is None and input_addresses:
+            token_address = input_addresses[0][1]
+            token_name = input_addresses[0][2]
+
+    # 1) 从 input 候选地址中找最像 ERC20 的地址（兜底）
+    if token_address is None:
+        first_contract_candidate: Optional[str] = None
+        for addr in _extract_addresses_from_input(input_data):
+            if addr.lower() in {tx_from, tx_to}:
                 continue
             try:
                 code = w3.eth.get_code(addr)
@@ -609,41 +622,22 @@ def extract_tx_extra_info(tx_hash: str) -> Tuple[Optional[str], Optional[str], O
                 continue
             if not code:
                 continue
-            token_address = addr
-            ok, readable_name = _is_probable_erc20(addr)
-            if ok:
+            if first_contract_candidate is None:
+                first_contract_candidate = addr
+            is_erc20, readable_name = _is_probable_erc20(addr)
+            if is_erc20:
+                token_address = addr
                 token_name = readable_name
-            break
+                break
 
-    # 1) 从 input 候选地址中找最像 ERC20 的地址
-    first_contract_candidate: Optional[str] = None
-    for addr in _extract_addresses_from_input(input_data):
-        if token_address:
-            break
-        if addr.lower() in {tx_from, tx_to}:
-            continue
-        try:
-            code = w3.eth.get_code(addr)
-        except Exception:
-            continue
-        if not code:
-            continue
-        if first_contract_candidate is None:
-            first_contract_candidate = addr
-        is_erc20, readable_name = _is_probable_erc20(addr)
-        if is_erc20:
-            token_address = addr
-            token_name = readable_name
-            break
-
-    if token_address is None and first_contract_candidate is not None:
-        token_address = first_contract_candidate
+        if token_address is None and first_contract_candidate is not None:
+            token_address = first_contract_candidate
 
     # 2) 解析可能的起止时间（优先动态数组解码结果）
     ts_list = decoded_ts if decoded_ts else _extract_timestamps_from_input(input_data)
     start_ts = ts_list[0] if len(ts_list) > 0 else None
     end_ts = ts_list[1] if len(ts_list) > 1 else None
-    return token_address, token_name, start_ts, end_ts
+    return token_address, token_name, start_ts, end_ts, input_addresses
 
 
 def extract_ido_extra_info(ido_address: str) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
@@ -728,8 +722,10 @@ def render_tx_extra_lines(
     start_ts: Optional[int],
     end_ts: Optional[int],
     show_when_empty: bool = False,
+    input_addresses: Optional[List[Tuple[int, str, Optional[str]]]] = None,
 ) -> List[str]:
-    if not (token_address or token_name or start_ts or end_ts):
+    has_data = token_address or token_name or start_ts or end_ts or input_addresses
+    if not has_data:
         if not show_when_empty:
             return []
         return ["", "<b>交易解析信息</b>", "未解析到代币/时间字段（可能该合约未暴露标准 getter）。"]
@@ -742,6 +738,14 @@ def render_tx_extra_lines(
         lines.append(f"开始时间：<code>{html.escape(_fmt_unix(start_ts))}</code>")
     if end_ts:
         lines.append(f"结束时间：<code>{html.escape(_fmt_unix(end_ts))}</code>")
+    if input_addresses:
+        lines.append("")
+        lines.append("<b>创建参数地址列表</b>")
+        for idx, addr, name in input_addresses:
+            if name:
+                lines.append(f"#{idx}: <code>{html.escape(addr)}</code> — {html.escape(name)}")
+            else:
+                lines.append(f"#{idx}: <code>{html.escape(addr)}</code>")
     return lines
 
 
@@ -757,7 +761,7 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
     matched_lines: List[str] = []
     new_ido_seen = 0
 
-    token_address, token_name, start_ts, end_ts = extract_tx_extra_info(tx_hash)
+    token_address, token_name, start_ts, end_ts, input_addresses = extract_tx_extra_info(tx_hash)
 
     for lg in logs:
         topics = lg.get("topics", [])
@@ -783,7 +787,7 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
         )
 
     if matched_lines:
-        extra_lines = render_tx_extra_lines(token_address, token_name, start_ts, end_ts, show_when_empty=True)
+        extra_lines = render_tx_extra_lines(token_address, token_name, start_ts, end_ts, show_when_empty=True, input_addresses=input_addresses)
         return True, (
             "<b>✅ 该交易会被机器人命中</b>\n"
             f"交易：<code>{html.escape(tx_hash)}</code>\n\n"
@@ -796,7 +800,7 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
     )
 
     if new_ido_seen == 0:
-        extra_lines = render_tx_extra_lines(token_address, token_name, start_ts, end_ts)
+        extra_lines = render_tx_extra_lines(token_address, token_name, start_ts, end_ts, input_addresses=input_addresses)
         return (
             False,
             "\n".join(
@@ -813,7 +817,7 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
             ),
         )
 
-    extra_lines = render_tx_extra_lines(token_address, token_name, start_ts, end_ts)
+    extra_lines = render_tx_extra_lines(token_address, token_name, start_ts, end_ts, input_addresses=input_addresses)
     return (
         False,
         "\n".join(
@@ -871,6 +875,7 @@ def render_notify_message(
     token_name: Optional[str] = None,
     start_ts: Optional[int] = None,
     end_ts: Optional[int] = None,
+    input_addresses: Optional[List[Tuple[int, str, Optional[str]]]] = None,
 ) -> str:
     watcher_name = watcher.label or watcher.address
 
@@ -894,6 +899,15 @@ def render_notify_message(
             lines.append(f"开始时间：<code>{html.escape(_fmt_unix(start_ts))}</code>")
         if end_ts:
             lines.append(f"结束时间：<code>{html.escape(_fmt_unix(end_ts))}</code>")
+
+    if input_addresses:
+        lines.append("")
+        lines.append("<b>创建参数地址列表</b>")
+        for idx, addr, name in input_addresses:
+            if name:
+                lines.append(f"#{idx}: <code>{html.escape(addr)}</code> — {html.escape(name)}")
+            else:
+                lines.append(f"#{idx}: <code>{html.escape(addr)}</code>")
 
     if ownership_changes:
         lines.append("")
@@ -1222,13 +1236,14 @@ async def scan_once(application: Application) -> None:
                     token_name: Optional[str] = None
                     start_ts: Optional[int] = None
                     end_ts: Optional[int] = None
+                    input_addresses: List[Tuple[int, str, Optional[str]]] = []
                     try:
                         receipt = await asyncio.to_thread(get_receipt, tx_hash)
                         ownership_changes = parse_ownership_transfers_from_receipt(receipt, ido_address)
                     except Exception as e:
                         logger.warning("receipt 解析失败 tx=%s err=%s", tx_hash, e)
                     try:
-                        token_address, token_name, start_ts, end_ts = await asyncio.to_thread(
+                        token_address, token_name, start_ts, end_ts, input_addresses = await asyncio.to_thread(
                             extract_tx_extra_info, tx_hash
                         )
                     except Exception as e:
@@ -1252,6 +1267,7 @@ async def scan_once(application: Application) -> None:
                         token_name=token_name,
                         start_ts=start_ts,
                         end_ts=end_ts,
+                        input_addresses=input_addresses,
                     )
                     await application.bot.send_message(
                         chat_id=watcher.chat_id,
