@@ -365,6 +365,34 @@ def _decode_abi_string(data_hex: str) -> Optional[str]:
         return None
 
 
+def _decode_abi_address(data_hex: str) -> Optional[str]:
+    if not data_hex or data_hex == "0x":
+        return None
+    raw = data_hex[2:] if data_hex.startswith("0x") else data_hex
+    if len(raw) < 64:
+        return None
+    word = raw[:64]
+    addr_hex = "0x" + word[-40:]
+    if addr_hex.lower() == "0x" + "0" * 40:
+        return None
+    try:
+        return checksum_address(addr_hex)
+    except Exception:
+        return None
+
+
+def _decode_abi_uint(data_hex: str) -> Optional[int]:
+    if not data_hex or data_hex == "0x":
+        return None
+    raw = data_hex[2:] if data_hex.startswith("0x") else data_hex
+    if len(raw) < 64:
+        return None
+    try:
+        return int(raw[:64], 16)
+    except Exception:
+        return None
+
+
 def _call_string_method(address: str, selector: str) -> Optional[str]:
     try:
         out = w3.eth.call({"to": checksum_address(address), "data": selector})
@@ -373,6 +401,30 @@ def _call_string_method(address: str, selector: str) -> Optional[str]:
         else:
             data_hex = str(out)
         return _decode_abi_string(data_hex)
+    except Exception:
+        return None
+
+
+def _call_address_method(address: str, selector: str) -> Optional[str]:
+    try:
+        out = w3.eth.call({"to": checksum_address(address), "data": selector})
+        if isinstance(out, (bytes, bytearray)):
+            data_hex = "0x" + bytes(out).hex()
+        else:
+            data_hex = str(out)
+        return _decode_abi_address(data_hex)
+    except Exception:
+        return None
+
+
+def _call_uint_method(address: str, selector: str) -> Optional[int]:
+    try:
+        out = w3.eth.call({"to": checksum_address(address), "data": selector})
+        if isinstance(out, (bytes, bytearray)):
+            data_hex = "0x" + bytes(out).hex()
+        else:
+            data_hex = str(out)
+        return _decode_abi_uint(data_hex)
     except Exception:
         return None
 
@@ -427,7 +479,7 @@ def _extract_timestamps_from_input(input_data: str) -> List[int]:
 def _fmt_unix(ts: int) -> str:
     dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
     dt_cn = dt_utc.astimezone(timezone(timedelta(hours=8)))
-    return f"{ts} (UTC {dt_utc:%Y-%m-%d %H:%M:%S}, UTC+8 {dt_cn:%Y-%m-%d %H:%M:%S})"
+    return f"{ts} (UTC+8 {dt_cn:%Y-%m-%d %H:%M:%S}, UTC {dt_utc:%Y-%m-%d %H:%M:%S})"
 
 
 def extract_tx_extra_info(tx_hash: str) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
@@ -464,6 +516,68 @@ def extract_tx_extra_info(tx_hash: str) -> Tuple[Optional[str], Optional[str], O
     start_ts = ts_list[0] if len(ts_list) > 0 else None
     end_ts = ts_list[1] if len(ts_list) > 1 else None
     return token_address, token_name, start_ts, end_ts
+
+
+def extract_ido_extra_info(ido_address: str) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
+    """
+    从已创建的 ido 合约读取常见 getter，作为 input 解析失败时的兜底。
+    返回：token_address, token_name, start_ts, end_ts
+    """
+    token_address: Optional[str] = None
+    token_name: Optional[str] = None
+    start_ts: Optional[int] = None
+    end_ts: Optional[int] = None
+
+    token_selectors = [
+        "0xfc0c546a",  # token()
+        "0xb33b96cc",  # saleToken()
+        "0xcef0a0ce",  # idoToken()
+        "0x1f1881f8",  # projectToken()
+    ]
+    start_selectors = [
+        "0x3f58c0d9",  # startTime()
+        "0x5ae401dc",  # startTimestamp()
+        "0x730f76c9",  # startAt()
+    ]
+    end_selectors = [
+        "0xefc81a8c",  # endTime()
+        "0x4f44f53d",  # endTimestamp()
+        "0x3f3f9ef3",  # endAt()
+    ]
+
+    for sel in token_selectors:
+        token_address = _call_address_method(ido_address, sel)
+        if token_address:
+            break
+    if token_address:
+        token_name = _call_string_method(token_address, "0x06fdde03")
+
+    for sel in start_selectors:
+        start_ts = _call_uint_method(ido_address, sel)
+        if start_ts and 1483228800 <= start_ts <= 2208988800:
+            break
+        start_ts = None
+    for sel in end_selectors:
+        end_ts = _call_uint_method(ido_address, sel)
+        if end_ts and 1483228800 <= end_ts <= 2208988800:
+            break
+        end_ts = None
+
+    return token_address, token_name, start_ts, end_ts
+
+
+def merge_extra_info(
+    primary: Tuple[Optional[str], Optional[str], Optional[int], Optional[int]],
+    fallback: Tuple[Optional[str], Optional[str], Optional[int], Optional[int]],
+) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
+    p_token_addr, p_token_name, p_start, p_end = primary
+    f_token_addr, f_token_name, f_start, f_end = fallback
+    return (
+        p_token_addr or f_token_addr,
+        p_token_name or f_token_name,
+        p_start or f_start,
+        p_end or f_end,
+    )
 
 
 def render_tx_extra_lines(
@@ -512,6 +626,10 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
         if not watcher:
             continue
         ido_address, _, block_number, log_index = parse_new_ido_log(lg)
+        token_address, token_name, start_ts, end_ts = merge_extra_info(
+            (token_address, token_name, start_ts, end_ts),
+            extract_ido_extra_info(ido_address),
+        )
         status = "启用" if watcher.enabled else "暂停"
         matched_lines.append(
             f"- 命中监控：<code>{html.escape(watcher.address)}</code>（{status}）\n"
@@ -967,6 +1085,14 @@ async def scan_once(application: Application) -> None:
                         )
                     except Exception as e:
                         logger.warning("tx input 解析失败 tx=%s err=%s", tx_hash, e)
+                    try:
+                        from_ido = await asyncio.to_thread(extract_ido_extra_info, ido_address)
+                        token_address, token_name, start_ts, end_ts = merge_extra_info(
+                            (token_address, token_name, start_ts, end_ts),
+                            from_ido,
+                        )
+                    except Exception as e:
+                        logger.warning("ido getter 解析失败 ido=%s tx=%s err=%s", ido_address, tx_hash, e)
 
                     text = render_notify_message(
                         watcher=watcher,
