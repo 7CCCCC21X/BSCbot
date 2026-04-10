@@ -64,6 +64,7 @@ NEW_IDO_TOPIC = Web3.keccak(text=NEW_IDO_EVENT).hex()
 OWNERSHIP_TRANSFERRED_TOPIC = Web3.keccak(text=OWNERSHIP_TRANSFERRED_EVENT).hex()
 
 ADDRESS_RE = re.compile(r"0x[a-fA-F0-9]{40}")
+TX_HASH_RE = re.compile(r"0x[a-fA-F0-9]{64}")
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -166,6 +167,13 @@ def extract_address(text: str) -> Optional[str]:
     if not m:
         return None
     return checksum_address(m.group(0))
+
+
+def extract_tx_hash(text: str) -> Optional[str]:
+    m = TX_HASH_RE.search(text or "")
+    if not m:
+        return None
+    return m.group(0)
 
 
 def current_unix() -> int:
@@ -330,6 +338,68 @@ def parse_new_ido_log(log) -> Tuple[str, str, int, int]:
     return ido_address, tx_hash, block_number, log_index
 
 
+def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
+    watchers = get_watchers_by_chat(chat_id)
+    if not watchers:
+        return False, "当前聊天还没有添加任何监控地址，请先 /add 或 /import。"
+
+    watcher_map = {w.address.lower(): w for w in watchers}
+    receipt = get_receipt(tx_hash)
+    logs = receipt.get("logs", [])
+
+    matched_lines: List[str] = []
+    new_ido_seen = 0
+
+    for lg in logs:
+        topics = lg.get("topics", [])
+        if not topics:
+            continue
+        if topics[0].hex().lower() != NEW_IDO_TOPIC.lower():
+            continue
+        new_ido_seen += 1
+        emitter = str(lg["address"]).lower()
+        watcher = watcher_map.get(emitter)
+        if not watcher:
+            continue
+        ido_address, _, block_number, log_index = parse_new_ido_log(lg)
+        status = "启用" if watcher.enabled else "暂停"
+        matched_lines.append(
+            f"- 命中监控：<code>{html.escape(watcher.address)}</code>（{status}）\n"
+            f"  新 IDO：<code>{html.escape(ido_address)}</code>\n"
+            f"  区块：<code>{block_number}</code>，logIndex：<code>{log_index}</code>"
+        )
+
+    if matched_lines:
+        return True, (
+            "<b>✅ 该交易会被机器人命中</b>\n"
+            f"交易：<code>{html.escape(tx_hash)}</code>\n\n"
+            + "\n".join(matched_lines)
+        )
+
+    watcher_addr_list = "\n".join(
+        f"- <code>{html.escape(w.address)}</code>（{'启用' if w.enabled else '暂停'}）" for w in watchers[:20]
+    )
+
+    if new_ido_seen == 0:
+        return (
+            False,
+            "<b>❌ 该交易不会被当前机器人命中</b>\n"
+            f"交易：<code>{html.escape(tx_hash)}</code>\n"
+            "原因：交易日志里未发现 <code>NewIDOContract(address)</code> 事件。\n\n"
+            "<b>当前聊天监控地址（前20个）</b>\n"
+            f"{watcher_addr_list}",
+        )
+
+    return (
+        False,
+        "<b>❌ 该交易不会被当前聊天命中</b>\n"
+        f"交易：<code>{html.escape(tx_hash)}</code>\n"
+        "原因：虽然交易里有 <code>NewIDOContract(address)</code>，但发事件的地址不在当前聊天监控列表中。\n\n"
+        "<b>当前聊天监控地址（前20个）</b>\n"
+        f"{watcher_addr_list}",
+    )
+
+
 # =========================
 # TG 输出
 # =========================
@@ -347,6 +417,7 @@ def help_text() -> str:
         "/del 地址 - 删除一个监控地址\n"
         "/pause 地址 - 暂停一个地址\n"
         "/resume 地址 - 恢复一个地址\n"
+        "/checktx 交易哈希 - 检查某笔交易能否被当前聊天命中\n"
         "/status - 查看机器人运行状态\n\n"
         "<b>批量导入格式</b>\n"
         "直接发送：\n"
@@ -624,6 +695,33 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def cmd_checktx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+
+    if not context.args:
+        await update.message.reply_text("用法：/checktx 0x交易哈希")
+        return
+
+    tx_hash = extract_tx_hash(context.args[0])
+    if not tx_hash:
+        await update.message.reply_text("交易哈希格式不正确，请输入 0x 开头的 66 位哈希。")
+        return
+
+    try:
+        ok, text = await asyncio.to_thread(analyze_tx_match_for_chat, update.effective_chat.id, tx_hash)
+    except Exception as e:
+        logger.exception("checktx 失败 tx=%s err=%s", tx_hash, e)
+        await update.message.reply_text(f"检查失败：{e}")
+        return
+
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
 # =========================
 # 后台扫描任务
 # =========================
@@ -720,6 +818,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("del", cmd_del))
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("checktx", cmd_checktx))
     app.add_handler(CommandHandler("status", cmd_status))
 
     # 周期扫描
