@@ -150,6 +150,15 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_watchers_enabled ON watchers(enabled, last_scanned_block)"
         )
+        # 管理员配置表
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_config (
+                chat_id INTEGER PRIMARY KEY,
+                admin_only INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
         conn.commit()
 
 
@@ -289,6 +298,83 @@ def enabled_count() -> int:
     with db_conn() as conn:
         row = conn.execute("SELECT COUNT(*) AS c FROM watchers WHERE enabled = 1").fetchone()
     return int(row["c"])
+
+
+def get_stats(chat_id: int) -> dict:
+    """获取指定聊天的统计信息。"""
+    with db_conn() as conn:
+        watcher_total = conn.execute(
+            "SELECT COUNT(*) AS c FROM watchers WHERE chat_id = ?", (chat_id,)
+        ).fetchone()["c"]
+        watcher_enabled = conn.execute(
+            "SELECT COUNT(*) AS c FROM watchers WHERE chat_id = ? AND enabled = 1", (chat_id,)
+        ).fetchone()["c"]
+        # 已检测到的 IDO 数量（通过 processed_events 关联 watchers）
+        ido_count = conn.execute(
+            """SELECT COUNT(*) AS c FROM processed_events pe
+               JOIN watchers w ON pe.watcher_id = w.id
+               WHERE w.chat_id = ?""",
+            (chat_id,),
+        ).fetchone()["c"]
+        # processed_events 总记录数
+        total_events = conn.execute("SELECT COUNT(*) AS c FROM processed_events").fetchone()["c"]
+        # 最早/最晚扫描区块
+        block_row = conn.execute(
+            "SELECT MIN(last_scanned_block) AS min_b, MAX(last_scanned_block) AS max_b FROM watchers WHERE chat_id = ? AND enabled = 1",
+            (chat_id,),
+        ).fetchone()
+    return {
+        "watcher_total": watcher_total,
+        "watcher_enabled": watcher_enabled,
+        "ido_count": ido_count,
+        "total_events": total_events,
+        "min_block": block_row["min_b"] or 0,
+        "max_block": block_row["max_b"] or 0,
+    }
+
+
+def cleanup_old_events(days: int = 30) -> int:
+    """清理旧的 processed_events（关联已删除的 watcher 或超过指定天数的记录）。"""
+    with db_conn() as conn:
+        # 清理孤儿记录（watcher 已删除）
+        orphan = conn.execute(
+            "DELETE FROM processed_events WHERE watcher_id NOT IN (SELECT id FROM watchers)"
+        ).rowcount
+        conn.commit()
+    return orphan
+
+
+def is_admin_only(chat_id: int) -> bool:
+    with db_conn() as conn:
+        row = conn.execute("SELECT admin_only FROM chat_config WHERE chat_id = ?", (chat_id,)).fetchone()
+    return bool(row and row["admin_only"])
+
+
+def set_admin_only(chat_id: int, enabled: bool) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT INTO chat_config(chat_id, admin_only) VALUES (?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET admin_only = ?",
+            (chat_id, 1 if enabled else 0, 1 if enabled else 0),
+        )
+        conn.commit()
+
+
+async def check_admin(update: Update) -> bool:
+    """检查用户是否是群管理员。私聊直接放行。"""
+    chat = update.effective_chat
+    if not chat or chat.type == "private":
+        return True
+    if not is_admin_only(chat.id):
+        return True
+    user = update.effective_user
+    if not user:
+        return False
+    try:
+        member = await chat.get_member(user.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
 
 
 # =========================
@@ -854,15 +940,11 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
         end_str = html.escape(_fmt_ts_short(end_ts)) if end_ts else None
         tx_link_safe = html.escape(tx_link)
 
-        if first_watcher_label:
-            cn_title = f"<b>{html.escape(first_watcher_label)}  部署新的IDO合约</b>"
-            en_title = f"<b>{html.escape(first_watcher_label)}  New IDO Contract Deployed</b>"
-        else:
-            cn_title = "<b>部署新的IDO合约</b>"
-            en_title = "<b>New IDO Contract Deployed</b>"
-
         # 中文
-        cn = [cn_title]
+        cn = []
+        if first_watcher_label:
+            cn.append(f"<b>{html.escape(first_watcher_label)}</b>")
+        cn.append("<b>部署新的IDO合约</b>")
         if token_name_safe:
             cn.append(f"代币名称：{token_name_safe}")
         if token_addr_safe:
@@ -877,7 +959,10 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
         cn.append(f"TX：{tx_link_safe}")
 
         # English
-        en = [en_title]
+        en = []
+        if first_watcher_label:
+            en.append(f"<b>{html.escape(first_watcher_label)}</b>")
+        en.append("<b>New IDO Contract Deployed</b>")
         if token_name_safe:
             en.append(f"Token Name: {token_name_safe}")
         if token_addr_safe:
@@ -990,16 +1075,11 @@ def render_notify_message(
     end_str = html.escape(_fmt_ts_short(end_ts)) if end_ts else None
     tx_link_safe = html.escape(tx_link)
 
-    # 有备注才显示备注，没有备注只显示标题
-    if watcher.label:
-        cn_title = f"<b>{html.escape(watcher.label)}  部署新的IDO合约</b>"
-        en_title = f"<b>{html.escape(watcher.label)}  New IDO Contract Deployed</b>"
-    else:
-        cn_title = "<b>部署新的IDO合约</b>"
-        en_title = "<b>New IDO Contract Deployed</b>"
-
     # --- 中文 ---
-    cn = [cn_title]
+    cn = []
+    if watcher.label:
+        cn.append(f"<b>{html.escape(watcher.label)}</b>")
+    cn.append("<b>部署新的IDO合约</b>")
     if token_name_safe:
         cn.append(f"代币名称：{token_name_safe}")
     if token_addr_safe:
@@ -1014,7 +1094,10 @@ def render_notify_message(
     cn.append(f"TX：{tx_link_safe}")
 
     # --- English ---
-    en = [en_title]
+    en = []
+    if watcher.label:
+        en.append(f"<b>{html.escape(watcher.label)}</b>")
+    en.append("<b>New IDO Contract Deployed</b>")
     if token_name_safe:
         en.append(f"Token Name: {token_name_safe}")
     if token_addr_safe:
@@ -1059,6 +1142,9 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
+    if not await check_admin(update):
+        await update.message.reply_text("仅管理员可执行此操作。")
+        return
 
     if not context.args:
         await update.message.reply_text("用法：/add 地址 备注\n例如：/add 0x1234... Pancake IDO Factory")
@@ -1086,6 +1172,9 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
+        return
+    if not await check_admin(update):
+        await update.message.reply_text("仅管理员可执行此操作。")
         return
 
     if not context.args:
@@ -1211,6 +1300,9 @@ def parse_import_payload(text: str) -> List[Tuple[str, str]]:
 async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
+    if not await check_admin(update):
+        await update.message.reply_text("仅管理员可执行此操作。")
+        return
 
     raw_text = update.message.text or ""
     items = parse_import_payload(raw_text)
@@ -1266,6 +1358,71 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"数据库：<code>{html.escape(DB_PATH)}</code>",
         parse_mode=ParseMode.HTML,
     )
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat_id = update.effective_chat.id
+    stats = get_stats(chat_id)
+    latest = await asyncio.to_thread(get_latest_block)
+    lag = latest - stats["max_block"] if stats["max_block"] else 0
+    await update.message.reply_text(
+        "<b>统计信息</b>\n"
+        f"监控地址：<code>{stats['watcher_total']}</code>（启用 {stats['watcher_enabled']}）\n"
+        f"已检测 IDO：<code>{stats['ido_count']}</code>\n"
+        f"最新区块：<code>{latest}</code>\n"
+        f"扫描进度：<code>{stats['max_block']}</code>（落后 {lag} 块）\n"
+        f"历史记录：<code>{stats['total_events']}</code> 条",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type == "private":
+        await update.message.reply_text("此命令仅在群聊中使用。")
+        return
+    # 只有群管理员能切换管理员模式
+    user = update.effective_user
+    if user:
+        try:
+            member = await chat.get_member(user.id)
+            if member.status not in ("administrator", "creator"):
+                await update.message.reply_text("仅群管理员可执行此操作。")
+                return
+        except Exception:
+            await update.message.reply_text("无法验证权限。")
+            return
+
+    arg = (context.args[0].lower() if context.args else "").strip()
+    if arg in ("on", "1", "开"):
+        set_admin_only(chat.id, True)
+        await update.message.reply_text("✅ 已开启管理员模式，仅管理员可 /add /del /import。")
+    elif arg in ("off", "0", "关"):
+        set_admin_only(chat.id, False)
+        await update.message.reply_text("✅ 已关闭管理员模式，所有人可操作。")
+    else:
+        current = "开启" if is_admin_only(chat.id) else "关闭"
+        await update.message.reply_text(
+            f"当前管理员模式：<b>{current}</b>\n\n"
+            "用法：\n"
+            "/admin on - 开启（仅管理员可 /add /del /import）\n"
+            "/admin off - 关闭（所有人可操作）",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if not await check_admin(update):
+        await update.message.reply_text("仅管理员可执行此操作。")
+        return
+    cleaned = await asyncio.to_thread(cleanup_old_events)
+    await update.message.reply_text(f"✅ 清理完成，删除 {cleaned} 条孤儿记录。")
 
 
 async def cmd_checktx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1579,7 +1736,9 @@ async def post_init(application: Application) -> None:
         BotCommand("pause", "暂停监控地址"),
         BotCommand("resume", "恢复监控地址"),
         BotCommand("checktx", "检查交易是否命中"),
-        BotCommand("debugtx", "调试交易解析"),
+        BotCommand("stats", "查看统计信息"),
+        BotCommand("admin", "管理员模式开关"),
+        BotCommand("cleanup", "清理旧数据"),
         BotCommand("status", "查看机器人状态"),
         BotCommand("chatid", "查看聊天 ID"),
     ])
@@ -1599,6 +1758,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("checktx", cmd_checktx))
     app.add_handler(CommandHandler("debugtx", cmd_debugtx))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("cleanup", cmd_cleanup))
     app.add_handler(CommandHandler("status", cmd_status))
 
     # 周期扫描
@@ -1609,6 +1771,9 @@ def build_app() -> Application:
 def main() -> None:
     logger.info("初始化数据库... path=%s", DB_PATH)
     init_db()
+    cleaned = cleanup_old_events()
+    if cleaned:
+        logger.info("启动清理：删除 %d 条孤儿记录", cleaned)
     logger.info("机器人启动中... RPC=%s", BSC_RPC_URL)
     app = build_app()
     app.run_polling(drop_pending_updates=True)
