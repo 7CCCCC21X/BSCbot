@@ -26,6 +26,7 @@ import os
 import re
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -338,6 +339,153 @@ def parse_new_ido_log(log) -> Tuple[str, str, int, int]:
     return ido_address, tx_hash, block_number, log_index
 
 
+def _decode_abi_string(data_hex: str) -> Optional[str]:
+    if not data_hex or data_hex == "0x":
+        return None
+    raw = data_hex[2:] if data_hex.startswith("0x") else data_hex
+    if len(raw) == 64:
+        # 某些合约返回 bytes32
+        b = bytes.fromhex(raw)
+        return b.split(b"\x00", 1)[0].decode("utf-8", errors="ignore").strip() or None
+    if len(raw) < 192:
+        return None
+    try:
+        offset = int(raw[0:64], 16) * 2
+        if offset + 64 > len(raw):
+            return None
+        strlen = int(raw[offset: offset + 64], 16)
+        start = offset + 64
+        end = start + strlen * 2
+        if end > len(raw):
+            return None
+        b = bytes.fromhex(raw[start:end])
+        s = b.decode("utf-8", errors="ignore").strip()
+        return s or None
+    except Exception:
+        return None
+
+
+def _call_string_method(address: str, selector: str) -> Optional[str]:
+    try:
+        out = w3.eth.call({"to": checksum_address(address), "data": selector})
+        if isinstance(out, (bytes, bytearray)):
+            data_hex = "0x" + bytes(out).hex()
+        else:
+            data_hex = str(out)
+        return _decode_abi_string(data_hex)
+    except Exception:
+        return None
+
+
+def _extract_addresses_from_input(input_data: str) -> List[str]:
+    if not input_data or input_data == "0x":
+        return []
+    data = input_data[2:] if input_data.startswith("0x") else input_data
+    if len(data) <= 8:
+        return []
+    payload = data[8:]  # 去掉 4-byte selector
+    words = [payload[i: i + 64] for i in range(0, len(payload), 64) if len(payload[i: i + 64]) == 64]
+    seen = set()
+    out: List[str] = []
+    for w in words:
+        if w[:24] != "0" * 24:
+            continue
+        addr_hex = "0x" + w[24:]
+        if addr_hex.lower() == "0x" + "0" * 40:
+            continue
+        try:
+            addr = checksum_address(addr_hex)
+        except Exception:
+            continue
+        low = addr.lower()
+        if low not in seen:
+            seen.add(low)
+            out.append(addr)
+    return out
+
+
+def _extract_timestamps_from_input(input_data: str) -> List[int]:
+    if not input_data or input_data == "0x":
+        return []
+    data = input_data[2:] if input_data.startswith("0x") else input_data
+    if len(data) <= 8:
+        return []
+    payload = data[8:]
+    words = [payload[i: i + 64] for i in range(0, len(payload), 64) if len(payload[i: i + 64]) == 64]
+    out: List[int] = []
+    for w in words:
+        try:
+            v = int(w, 16)
+        except Exception:
+            continue
+        # 粗略过滤：2017-01-01 ~ 2040-01-01 的 unix 秒
+        if 1483228800 <= v <= 2208988800:
+            out.append(v)
+    return out
+
+
+def _fmt_unix(ts: int) -> str:
+    dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+    dt_cn = dt_utc.astimezone(timezone(timedelta(hours=8)))
+    return f"{ts} (UTC {dt_utc:%Y-%m-%d %H:%M:%S}, UTC+8 {dt_cn:%Y-%m-%d %H:%M:%S})"
+
+
+def extract_tx_extra_info(tx_hash: str) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
+    """
+    返回：token_address, token_name, start_ts, end_ts
+    说明：从创建交易 input 中启发式提取，适配大多数工厂 create 参数布局。
+    """
+    try:
+        tx = w3.eth.get_transaction(tx_hash)
+    except Exception:
+        return None, None, None, None
+
+    input_data = tx.get("input", "") if isinstance(tx, dict) else getattr(tx, "input", "")
+
+    token_address: Optional[str] = None
+    token_name: Optional[str] = None
+
+    # 1) 从 input 候选地址中找第一个像 ERC20 的地址（能读到 name）
+    for addr in _extract_addresses_from_input(input_data):
+        try:
+            code = w3.eth.get_code(addr)
+        except Exception:
+            continue
+        if not code:
+            continue
+        name = _call_string_method(addr, "0x06fdde03")  # name()
+        if name:
+            token_address = addr
+            token_name = name
+            break
+
+    # 2) 解析可能的起止时间（取前两个）
+    ts_list = _extract_timestamps_from_input(input_data)
+    start_ts = ts_list[0] if len(ts_list) > 0 else None
+    end_ts = ts_list[1] if len(ts_list) > 1 else None
+    return token_address, token_name, start_ts, end_ts
+
+
+def render_tx_extra_lines(
+    token_address: Optional[str],
+    token_name: Optional[str],
+    start_ts: Optional[int],
+    end_ts: Optional[int],
+) -> List[str]:
+    if not (token_address or token_name or start_ts or end_ts):
+        return []
+    lines = ["", "<b>交易解析信息</b>"]
+    if token_name:
+        lines.append(f"代币名称：<code>{html.escape(token_name)}</code>")
+    if token_address:
+        lines.append(f"代币合约：<code>{html.escape(token_address)}</code>")
+    if start_ts:
+        lines.append(f"开始时间：<code>{html.escape(_fmt_unix(start_ts))}</code>")
+    if end_ts:
+        lines.append(f"结束时间：<code>{html.escape(_fmt_unix(end_ts))}</code>")
+    return lines
+
+
 def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
     watchers = get_watchers_by_chat(chat_id)
     if not watchers:
@@ -349,6 +497,8 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
 
     matched_lines: List[str] = []
     new_ido_seen = 0
+
+    token_address, token_name, start_ts, end_ts = extract_tx_extra_info(tx_hash)
 
     for lg in logs:
         topics = lg.get("topics", [])
@@ -370,10 +520,11 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
         )
 
     if matched_lines:
+        extra_lines = render_tx_extra_lines(token_address, token_name, start_ts, end_ts)
         return True, (
             "<b>✅ 该交易会被机器人命中</b>\n"
             f"交易：<code>{html.escape(tx_hash)}</code>\n\n"
-            + "\n".join(matched_lines)
+            + "\n".join(matched_lines + extra_lines)
         )
 
     watcher_addr_list = "\n".join(
@@ -381,22 +532,36 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
     )
 
     if new_ido_seen == 0:
+        extra_lines = render_tx_extra_lines(token_address, token_name, start_ts, end_ts)
         return (
             False,
-            "<b>❌ 该交易不会被当前机器人命中</b>\n"
-            f"交易：<code>{html.escape(tx_hash)}</code>\n"
-            "原因：交易日志里未发现 <code>NewIDOContract(address)</code> 事件。\n\n"
-            "<b>当前聊天监控地址（前20个）</b>\n"
-            f"{watcher_addr_list}",
+            "\n".join(
+                [
+                    "<b>❌ 该交易不会被当前机器人命中</b>",
+                    f"交易：<code>{html.escape(tx_hash)}</code>",
+                    "原因：交易日志里未发现 <code>NewIDOContract(address)</code> 事件。",
+                    *extra_lines,
+                    "",
+                    "<b>当前聊天监控地址（前20个）</b>",
+                    watcher_addr_list,
+                ]
+            ),
         )
 
+    extra_lines = render_tx_extra_lines(token_address, token_name, start_ts, end_ts)
     return (
         False,
-        "<b>❌ 该交易不会被当前聊天命中</b>\n"
-        f"交易：<code>{html.escape(tx_hash)}</code>\n"
-        "原因：虽然交易里有 <code>NewIDOContract(address)</code>，但发事件的地址不在当前聊天监控列表中。\n\n"
-        "<b>当前聊天监控地址（前20个）</b>\n"
-        f"{watcher_addr_list}",
+        "\n".join(
+            [
+                "<b>❌ 该交易不会被当前聊天命中</b>",
+                f"交易：<code>{html.escape(tx_hash)}</code>",
+                "原因：虽然交易里有 <code>NewIDOContract(address)</code>，但发事件的地址不在当前聊天监控列表中。",
+                *extra_lines,
+                "",
+                "<b>当前聊天监控地址（前20个）</b>",
+                watcher_addr_list,
+            ]
+        ),
     )
 
 
@@ -436,6 +601,10 @@ def render_notify_message(
     tx_hash: str,
     block_number: int,
     ownership_changes: Sequence[Tuple[str, str]],
+    token_address: Optional[str] = None,
+    token_name: Optional[str] = None,
+    start_ts: Optional[int] = None,
+    end_ts: Optional[int] = None,
 ) -> str:
     watcher_name = watcher.label or watcher.address
 
@@ -447,6 +616,18 @@ def render_notify_message(
         f"区块：<code>{block_number}</code>",
         f"交易哈希：<code>{html.escape(tx_hash)}</code>",
     ]
+
+    if token_address or token_name or start_ts or end_ts:
+        lines.append("")
+        lines.append("<b>IDO 关键信息（从创建交易解析）</b>")
+        if token_name:
+            lines.append(f"代币名称：<code>{html.escape(token_name)}</code>")
+        if token_address:
+            lines.append(f"代币合约：<code>{html.escape(token_address)}</code>")
+        if start_ts:
+            lines.append(f"开始时间：<code>{html.escape(_fmt_unix(start_ts))}</code>")
+        if end_ts:
+            lines.append(f"结束时间：<code>{html.escape(_fmt_unix(end_ts))}</code>")
 
     if ownership_changes:
         lines.append("")
@@ -771,11 +952,21 @@ async def scan_once(application: Application) -> None:
                         continue
 
                     ownership_changes: List[Tuple[str, str]] = []
+                    token_address: Optional[str] = None
+                    token_name: Optional[str] = None
+                    start_ts: Optional[int] = None
+                    end_ts: Optional[int] = None
                     try:
                         receipt = await asyncio.to_thread(get_receipt, tx_hash)
                         ownership_changes = parse_ownership_transfers_from_receipt(receipt, ido_address)
                     except Exception as e:
                         logger.warning("receipt 解析失败 tx=%s err=%s", tx_hash, e)
+                    try:
+                        token_address, token_name, start_ts, end_ts = await asyncio.to_thread(
+                            extract_tx_extra_info, tx_hash
+                        )
+                    except Exception as e:
+                        logger.warning("tx input 解析失败 tx=%s err=%s", tx_hash, e)
 
                     text = render_notify_message(
                         watcher=watcher,
@@ -783,6 +974,10 @@ async def scan_once(application: Application) -> None:
                         tx_hash=tx_hash,
                         block_number=block_number,
                         ownership_changes=ownership_changes,
+                        token_address=token_address,
+                        token_name=token_name,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
                     )
                     await application.bot.send_message(
                         chat_id=watcher.chat_id,
