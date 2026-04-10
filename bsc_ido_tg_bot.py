@@ -580,6 +580,11 @@ def extract_tx_extra_info(
         return None, None, None, None, []
 
     input_data = tx.get("input", "") if isinstance(tx, dict) else getattr(tx, "input", "")
+    # web3.py 可能返回 HexBytes（bytes 子类），需要转为 hex 字符串
+    if isinstance(input_data, (bytes, bytearray)):
+        input_data = "0x" + input_data.hex()
+    elif not isinstance(input_data, str):
+        input_data = str(input_data)
     tx_from = str(tx.get("from", "")).lower() if isinstance(tx, dict) else str(getattr(tx, "from", "")).lower()
     tx_to = str(tx.get("to", "")).lower() if isinstance(tx, dict) else str(getattr(tx, "to", "")).lower()
 
@@ -612,7 +617,9 @@ def extract_tx_extra_info(
 
     # 1) 从 input 候选地址中找最像 ERC20 的地址（兜底）
     if token_address is None:
+        seen_addrs = {a[1].lower() for a in input_addresses}
         first_contract_candidate: Optional[str] = None
+        fallback_idx = 0
         for addr in _extract_addresses_from_input(input_data):
             if addr.lower() in {tx_from, tx_to}:
                 continue
@@ -625,6 +632,11 @@ def extract_tx_extra_info(
             if first_contract_candidate is None:
                 first_contract_candidate = addr
             is_erc20, readable_name = _is_probable_erc20(addr)
+            # 同时收集到 input_addresses 用于展示（去重）
+            if addr.lower() not in seen_addrs:
+                input_addresses.append((fallback_idx, addr, readable_name if is_erc20 else None))
+                seen_addrs.add(addr.lower())
+                fallback_idx += 1
             if is_erc20:
                 token_address = addr
                 token_name = readable_name
