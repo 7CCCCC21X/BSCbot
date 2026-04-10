@@ -311,6 +311,26 @@ def get_receipt(tx_hash_hex: str):
     return w3.eth.get_transaction_receipt(tx_hash_hex)
 
 
+def _get_raw_transaction(tx_hash: str) -> Optional[dict]:
+    """
+    当 w3.eth.get_transaction 因格式化错误（如 chainId 为空）失败时，
+    使用原始 RPC 调用绕过 web3.py 的结果格式化器。
+    """
+    try:
+        return w3.eth.get_transaction(tx_hash)
+    except Exception:
+        pass
+    # 兜底：直接发原始 JSON-RPC 请求
+    try:
+        resp = w3.provider.make_request("eth_getTransactionByHash", [tx_hash])
+        result = resp.get("result")
+        if result and isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+    return None
+
+
 def parse_ownership_transfers_from_receipt(receipt, ido_address: str) -> List[Tuple[str, str]]:
     ido_lc = ido_address.lower()
     items: List[Tuple[str, str]] = []
@@ -574,13 +594,12 @@ def extract_tx_extra_info(
     说明：从创建交易 input 中启发式提取，适配大多数工厂 create 参数布局。
     input_addresses: 输入参数中解码出的所有非零地址列表，格式 [(索引, 地址, 名称或None), ...]。
     """
-    try:
-        tx = w3.eth.get_transaction(tx_hash)
-    except Exception:
+    tx = _get_raw_transaction(tx_hash)
+    if tx is None:
         return None, None, None, None, []
 
     input_data = tx.get("input", "") if isinstance(tx, dict) else getattr(tx, "input", "")
-    # web3.py 可能返回 HexBytes（bytes 子类），需要转为 hex 字符串
+    # web3.py 可能返回 HexBytes（bytes 子类），原始 RPC 返回 hex 字符串
     if isinstance(input_data, (bytes, bytearray)):
         input_data = "0x" + input_data.hex()
     elif not isinstance(input_data, str):
@@ -1200,10 +1219,23 @@ def debug_tx_parsing(tx_hash: str) -> str:
     lines: List[str] = [f"<b>🔍 调试交易解析</b>\n交易：<code>{html.escape(tx_hash)}</code>"]
 
     # 1) 获取交易
+    tx = None
     try:
         tx = w3.eth.get_transaction(tx_hash)
+        lines.append("\n✅ get_transaction 成功")
     except Exception as e:
-        lines.append(f"\n❌ get_transaction 失败：{html.escape(str(e))}")
+        lines.append(f"\n⚠️ get_transaction 失败：{html.escape(str(e)[:100])}")
+        lines.append("尝试原始 RPC 兜底...")
+        try:
+            resp = w3.provider.make_request("eth_getTransactionByHash", [tx_hash])
+            tx = resp.get("result")
+            if tx and isinstance(tx, dict):
+                lines.append("✅ 原始 RPC 获取成功")
+            else:
+                lines.append("❌ 原始 RPC 返回空")
+        except Exception as e2:
+            lines.append(f"❌ 原始 RPC 也失败：{html.escape(str(e2)[:100])}")
+    if not tx:
         return "\n".join(lines)
 
     raw_input = tx.get("input", "") if isinstance(tx, dict) else getattr(tx, "input", "")
