@@ -429,6 +429,23 @@ def _call_uint_method(address: str, selector: str) -> Optional[int]:
         return None
 
 
+def _is_probable_erc20(address: str) -> Tuple[bool, Optional[str]]:
+    # 返回：是否像 ERC20，和可读名称（优先 name，其次 symbol）
+    name = _call_string_method(address, _selector("name()"))
+    if name:
+        return True, name
+    symbol = _call_string_method(address, _selector("symbol()"))
+    if symbol:
+        return True, f"({symbol})"
+    decimals = _call_uint_method(address, _selector("decimals()"))
+    if decimals is not None and 0 <= decimals <= 36:
+        return True, None
+    total_supply = _call_uint_method(address, _selector("totalSupply()"))
+    if total_supply is not None:
+        return True, None
+    return False, None
+
+
 def _selector(signature: str) -> str:
     return "0x" + Web3.keccak(text=signature).hex()[:8]
 
@@ -480,6 +497,69 @@ def _extract_timestamps_from_input(input_data: str) -> List[int]:
     return out
 
 
+def _decode_create_ido_input(input_data: str) -> Tuple[List[str], List[int]]:
+    """
+    尝试按 ABI 动态数组布局解析 createIDO 类参数：
+      (address[] _addresses, uint256[] _startAndEndTimestamps, ...)
+    不依赖具体函数签名，只要前两个参数是动态数组即可。
+    """
+    if not input_data or input_data == "0x":
+        return [], []
+    data = input_data[2:] if input_data.startswith("0x") else input_data
+    if len(data) <= 8:
+        return [], []
+    payload = data[8:]  # 去掉 selector
+    if len(payload) < 64 * 2:
+        return [], []
+
+    def read_word(offset_hex_chars: int) -> Optional[int]:
+        if offset_hex_chars < 0 or offset_hex_chars + 64 > len(payload):
+            return None
+        try:
+            return int(payload[offset_hex_chars: offset_hex_chars + 64], 16)
+        except Exception:
+            return None
+
+    # 前两个参数 offset（按 ABI，offset 相对参数区起点）
+    off_addr = read_word(0)
+    off_ts = read_word(64)
+    if off_addr is None or off_ts is None:
+        return [], []
+
+    def read_dynamic_array(offset_bytes: int) -> List[int]:
+        base = offset_bytes * 2
+        arr_len = read_word(base)
+        if arr_len is None or arr_len < 0 or arr_len > 64:
+            return []
+        out: List[int] = []
+        p = base + 64
+        for _ in range(arr_len):
+            v = read_word(p)
+            if v is None:
+                break
+            out.append(v)
+            p += 64
+        return out
+
+    raw_addrs = read_dynamic_array(off_addr)
+    raw_ts = read_dynamic_array(off_ts)
+
+    addrs: List[str] = []
+    for v in raw_addrs:
+        addr_hex = f"0x{v:064x}"[-40:]
+        a = "0x" + addr_hex
+        if a.lower() == "0x" + "0" * 40:
+            addrs.append(a)
+            continue
+        try:
+            addrs.append(checksum_address(a))
+        except Exception:
+            addrs.append(a)
+
+    ts = [x for x in raw_ts if 1483228800 <= x <= 2208988800]
+    return addrs, ts
+
+
 def _fmt_unix(ts: int) -> str:
     dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
     dt_cn = dt_utc.astimezone(timezone(timedelta(hours=8)))
@@ -497,26 +577,61 @@ def extract_tx_extra_info(tx_hash: str) -> Tuple[Optional[str], Optional[str], O
         return None, None, None, None
 
     input_data = tx.get("input", "") if isinstance(tx, dict) else getattr(tx, "input", "")
+    tx_from = str(tx.get("from", "")).lower() if isinstance(tx, dict) else str(getattr(tx, "from", "")).lower()
+    tx_to = str(tx.get("to", "")).lower() if isinstance(tx, dict) else str(getattr(tx, "to", "")).lower()
 
     token_address: Optional[str] = None
     token_name: Optional[str] = None
 
-    # 1) 从 input 候选地址中找第一个像 ERC20 的地址（能读到 name）
+    decoded_addrs, decoded_ts = _decode_create_ido_input(input_data)
+
+    # 优先按 createIDO 常见布局取 _addresses[2] 为 sale token
+    if decoded_addrs:
+        preferred_indexes = [2, 1, 0, 3]
+        for idx in preferred_indexes:
+            if idx >= len(decoded_addrs):
+                continue
+            addr = decoded_addrs[idx]
+            if addr.lower() == "0x" + "0" * 40:
+                continue
+            try:
+                code = w3.eth.get_code(addr)
+            except Exception:
+                continue
+            if not code:
+                continue
+            token_address = addr
+            ok, readable_name = _is_probable_erc20(addr)
+            if ok:
+                token_name = readable_name
+            break
+
+    # 1) 从 input 候选地址中找最像 ERC20 的地址
+    first_contract_candidate: Optional[str] = None
     for addr in _extract_addresses_from_input(input_data):
+        if token_address:
+            break
+        if addr.lower() in {tx_from, tx_to}:
+            continue
         try:
             code = w3.eth.get_code(addr)
         except Exception:
             continue
         if not code:
             continue
-        name = _call_string_method(addr, "0x06fdde03")  # name()
-        if name:
+        if first_contract_candidate is None:
+            first_contract_candidate = addr
+        is_erc20, readable_name = _is_probable_erc20(addr)
+        if is_erc20:
             token_address = addr
-            token_name = name
+            token_name = readable_name
             break
 
-    # 2) 解析可能的起止时间（取前两个）
-    ts_list = _extract_timestamps_from_input(input_data)
+    if token_address is None and first_contract_candidate is not None:
+        token_address = first_contract_candidate
+
+    # 2) 解析可能的起止时间（优先动态数组解码结果）
+    ts_list = decoded_ts if decoded_ts else _extract_timestamps_from_input(input_data)
     start_ts = ts_list[0] if len(ts_list) > 0 else None
     end_ts = ts_list[1] if len(ts_list) > 1 else None
     return token_address, token_name, start_ts, end_ts
@@ -664,6 +779,7 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
             "<b>✅ 该交易会被机器人命中</b>\n"
             f"交易：<code>{html.escape(tx_hash)}</code>\n\n"
             + "\n".join(matched_lines + extra_lines)
+            + f"\n\n<a href=\"{html.escape(BSCSCAN_TX + tx_hash)}\">打开 BscScan 交易</a>"
         )
 
     watcher_addr_list = "\n".join(
@@ -680,6 +796,7 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
                     f"交易：<code>{html.escape(tx_hash)}</code>",
                     "原因：交易日志里未发现 <code>NewIDOContract(address)</code> 事件。",
                     *extra_lines,
+                    f"<a href=\"{html.escape(BSCSCAN_TX + tx_hash)}\">打开 BscScan 交易</a>",
                     "",
                     "<b>当前聊天监控地址（前20个）</b>",
                     watcher_addr_list,
@@ -696,6 +813,7 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
                 f"交易：<code>{html.escape(tx_hash)}</code>",
                 "原因：虽然交易里有 <code>NewIDOContract(address)</code>，但发事件的地址不在当前聊天监控列表中。",
                 *extra_lines,
+                f"<a href=\"{html.escape(BSCSCAN_TX + tx_hash)}\">打开 BscScan 交易</a>",
                 "",
                 "<b>当前聊天监控地址（前20个）</b>",
                 watcher_addr_list,
