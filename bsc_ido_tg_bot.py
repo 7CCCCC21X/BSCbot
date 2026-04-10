@@ -587,8 +587,17 @@ def extract_tx_extra_info(tx_hash: str) -> Tuple[Optional[str], Optional[str], O
 
     # 优先按 createIDO 常见布局取 _addresses[2] 为 sale token
     if decoded_addrs:
+        # 先按固定位置直接取，避免因为 code/name 探测失败导致地址都不显示
+        if len(decoded_addrs) > 2 and decoded_addrs[2].lower() != "0x" + "0" * 40:
+            token_address = decoded_addrs[2]
+            ok, readable_name = _is_probable_erc20(decoded_addrs[2])
+            if ok:
+                token_name = readable_name
+
         preferred_indexes = [2, 1, 0, 3]
         for idx in preferred_indexes:
+            if token_address:
+                break
             if idx >= len(decoded_addrs):
                 continue
             addr = decoded_addrs[idx]
