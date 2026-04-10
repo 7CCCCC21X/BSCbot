@@ -1195,6 +1195,158 @@ async def cmd_checktx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+def debug_tx_parsing(tx_hash: str) -> str:
+    """逐步调试交易 input 解析，返回详细诊断信息。"""
+    lines: List[str] = [f"<b>🔍 调试交易解析</b>\n交易：<code>{html.escape(tx_hash)}</code>"]
+
+    # 1) 获取交易
+    try:
+        tx = w3.eth.get_transaction(tx_hash)
+    except Exception as e:
+        lines.append(f"\n❌ get_transaction 失败：{html.escape(str(e))}")
+        return "\n".join(lines)
+
+    raw_input = tx.get("input", "") if isinstance(tx, dict) else getattr(tx, "input", "")
+    lines.append(f"\n<b>input_data 类型</b>：<code>{html.escape(type(raw_input).__name__)}</code>")
+    lines.append(f"<b>input_data 长度</b>：<code>{len(raw_input)}</code>")
+
+    # 转换为字符串
+    if isinstance(raw_input, (bytes, bytearray)):
+        input_data = "0x" + raw_input.hex()
+        lines.append("✅ 已从 bytes 转为 hex 字符串")
+    elif isinstance(raw_input, str):
+        input_data = raw_input
+        lines.append("✅ input_data 已经是字符串")
+    else:
+        input_data = str(raw_input)
+        lines.append(f"⚠️ 非预期类型，str() 转换：<code>{html.escape(input_data[:80])}</code>")
+
+    lines.append(f"<b>hex 长度</b>：<code>{len(input_data)}</code>")
+    if len(input_data) >= 10:
+        lines.append(f"<b>selector</b>：<code>{html.escape(input_data[:10])}</code>")
+
+    # 2) 解码动态数组
+    lines.append("\n<b>--- _decode_create_ido_input ---</b>")
+    try:
+        decoded_addrs, decoded_ts = _decode_create_ido_input(input_data)
+        lines.append(f"decoded_addrs 数量：<code>{len(decoded_addrs)}</code>")
+        for i, addr in enumerate(decoded_addrs):
+            lines.append(f"  [{i}] <code>{html.escape(addr)}</code>")
+        lines.append(f"decoded_ts 数量：<code>{len(decoded_ts)}</code>")
+        for i, ts in enumerate(decoded_ts):
+            lines.append(f"  [{i}] <code>{ts}</code> → {html.escape(_fmt_unix(ts))}")
+    except Exception as e:
+        lines.append(f"❌ 解码失败：<code>{html.escape(str(e))}</code>")
+        decoded_addrs, decoded_ts = [], []
+
+    # 3) 逐个地址检测
+    if decoded_addrs:
+        lines.append("\n<b>--- 逐个地址检测 ---</b>")
+        for i, addr in enumerate(decoded_addrs):
+            if addr.lower() == "0x" + "0" * 40:
+                lines.append(f"[{i}] 零地址，跳过")
+                continue
+            # get_code
+            try:
+                code = w3.eth.get_code(addr)
+                has_code = bool(code and code != b"" and code != b"0x")
+                lines.append(f"[{i}] <code>{html.escape(addr)}</code>")
+                lines.append(f"    get_code: {'✅ 有代码' if has_code else '❌ 无代码'}（{len(code)} bytes）")
+            except Exception as e:
+                lines.append(f"[{i}] <code>{html.escape(addr)}</code>")
+                lines.append(f"    get_code: ❌ 异常 {html.escape(str(e)[:80])}")
+                continue
+            # ERC20 检测
+            try:
+                ok, readable_name = _is_probable_erc20(addr)
+                lines.append(f"    is_erc20: {'✅' if ok else '❌'}，name={html.escape(str(readable_name))}")
+            except Exception as e:
+                lines.append(f"    is_erc20: ❌ 异常 {html.escape(str(e)[:80])}")
+            # 额外尝试 name()
+            try:
+                name = _call_string_method(addr, _selector("name()"))
+                lines.append(f"    name(): <code>{html.escape(str(name))}</code>")
+            except Exception as e:
+                lines.append(f"    name(): ❌ {html.escape(str(e)[:60])}")
+
+    # 4) 兜底地址扫描
+    lines.append("\n<b>--- _extract_addresses_from_input ---</b>")
+    try:
+        fallback_addrs = _extract_addresses_from_input(input_data)
+        lines.append(f"找到 {len(fallback_addrs)} 个地址")
+        tx_from = str(tx.get("from", "")).lower() if isinstance(tx, dict) else str(getattr(tx, "from", "")).lower()
+        tx_to = str(tx.get("to", "")).lower() if isinstance(tx, dict) else str(getattr(tx, "to", "")).lower()
+        for addr in fallback_addrs[:10]:
+            skip_reason = ""
+            if addr.lower() == tx_from:
+                skip_reason = " ← 是 tx.from，会跳过"
+            elif addr.lower() == tx_to:
+                skip_reason = " ← 是 tx.to，会跳过"
+            lines.append(f"  <code>{html.escape(addr)}</code>{skip_reason}")
+    except Exception as e:
+        lines.append(f"❌ 失败：{html.escape(str(e)[:80])}")
+
+    # 5) IDO 合约 getter 检测
+    lines.append("\n<b>--- extract_ido_extra_info ---</b>")
+    # 从 receipt 找 IDO 地址
+    try:
+        receipt = get_receipt(tx_hash)
+        ido_address = None
+        for lg in receipt.get("logs", []):
+            topics = lg.get("topics", [])
+            if topics and topics[0].hex().lower() == NEW_IDO_TOPIC.lower():
+                ido_address, _, _, _ = parse_new_ido_log(lg)
+                break
+        if ido_address:
+            lines.append(f"IDO 合约：<code>{html.escape(ido_address)}</code>")
+            try:
+                ido_token, ido_name, ido_start, ido_end = extract_ido_extra_info(ido_address)
+                lines.append(f"  token_addr: <code>{html.escape(str(ido_token))}</code>")
+                lines.append(f"  token_name: <code>{html.escape(str(ido_name))}</code>")
+                lines.append(f"  start_ts: <code>{ido_start}</code>")
+                lines.append(f"  end_ts: <code>{ido_end}</code>")
+            except Exception as e:
+                lines.append(f"  ❌ 查询失败：{html.escape(str(e)[:80])}")
+        else:
+            lines.append("未找到 NewIDOContract 事件")
+    except Exception as e:
+        lines.append(f"❌ receipt 获取失败：{html.escape(str(e)[:80])}")
+
+    return "\n".join(lines)
+
+
+async def cmd_debugtx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if not context.args:
+        await update.message.reply_text("用法：/debugtx 0x交易哈希")
+        return
+    tx_hash = extract_tx_hash(context.args[0])
+    if not tx_hash:
+        await update.message.reply_text("交易哈希格式不正确，请输入 0x 开头的 66 位哈希。")
+        return
+    try:
+        text = await asyncio.to_thread(debug_tx_parsing, tx_hash)
+    except Exception as e:
+        logger.exception("debugtx 失败 tx=%s err=%s", tx_hash, e)
+        await update.message.reply_text(f"调试失败：{e}")
+        return
+    # 分段发送，避免超长
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            await update.message.reply_text(
+                text[i:i + 4000],
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+    else:
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+
 # =========================
 # 后台扫描任务
 # =========================
@@ -1316,6 +1468,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("checktx", cmd_checktx))
+    app.add_handler(CommandHandler("debugtx", cmd_debugtx))
     app.add_handler(CommandHandler("status", cmd_status))
 
     # 周期扫描
