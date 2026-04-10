@@ -941,10 +941,11 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
         tx_link_safe = html.escape(tx_link)
 
         # 中文
-        cn = []
         if first_watcher_label:
-            cn.append(f"<b>{html.escape(first_watcher_label)}</b>")
-        cn.append("<b>部署新的IDO合约</b>")
+            cn_title = f"<b>{html.escape(first_watcher_label)}  部署新的IDO合约</b>"
+        else:
+            cn_title = "<b>部署新的IDO合约</b>"
+        cn = [cn_title]
         if token_name_safe:
             cn.append(f"代币名称：{token_name_safe}")
         if token_addr_safe:
@@ -959,10 +960,11 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
         cn.append(f"TX：{tx_link_safe}")
 
         # English
-        en = []
         if first_watcher_label:
-            en.append(f"<b>{html.escape(first_watcher_label)}</b>")
-        en.append("<b>New IDO Contract Deployed</b>")
+            en_title = f"<b>{html.escape(first_watcher_label)}  New IDO Contract Deployed</b>"
+        else:
+            en_title = "<b>New IDO Contract Deployed</b>"
+        en = [en_title]
         if token_name_safe:
             en.append(f"Token Name: {token_name_safe}")
         if token_addr_safe:
@@ -1076,10 +1078,11 @@ def render_notify_message(
     tx_link_safe = html.escape(tx_link)
 
     # --- 中文 ---
-    cn = []
     if watcher.label:
-        cn.append(f"<b>{html.escape(watcher.label)}</b>")
-    cn.append("<b>部署新的IDO合约</b>")
+        cn_title = f"<b>{html.escape(watcher.label)}  部署新的IDO合约</b>"
+    else:
+        cn_title = "<b>部署新的IDO合约</b>"
+    cn = [cn_title]
     if token_name_safe:
         cn.append(f"代币名称：{token_name_safe}")
     if token_addr_safe:
@@ -1094,10 +1097,11 @@ def render_notify_message(
     cn.append(f"TX：{tx_link_safe}")
 
     # --- English ---
-    en = []
     if watcher.label:
-        en.append(f"<b>{html.escape(watcher.label)}</b>")
-    en.append("<b>New IDO Contract Deployed</b>")
+        en_title = f"<b>{html.escape(watcher.label)}  New IDO Contract Deployed</b>"
+    else:
+        en_title = "<b>New IDO Contract Deployed</b>"
+    en = [en_title]
     if token_name_safe:
         en.append(f"Token Name: {token_name_safe}")
     if token_addr_safe:
