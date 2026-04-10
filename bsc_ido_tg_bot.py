@@ -580,6 +580,13 @@ def _decode_create_ido_input(input_data: str) -> Tuple[List[str], List[int]]:
     return addrs, ts
 
 
+def _fmt_ts_short(ts: int) -> str:
+    """格式化时间戳为简洁格式：YYYY-MM-DD HH:MM:SS UTC+8"""
+    dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+    dt_cn = dt_utc.astimezone(timezone(timedelta(hours=8)))
+    return f"{dt_cn:%Y-%m-%d %H:%M:%S} UTC+8"
+
+
 def _fmt_unix(ts: int) -> str:
     dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
     dt_cn = dt_utc.astimezone(timezone(timedelta(hours=8)))
@@ -759,24 +766,28 @@ def render_tx_extra_lines(
     if not has_data:
         if not show_when_empty:
             return []
-        return ["", "<b>交易解析信息</b>", "未解析到代币/时间字段（可能该合约未暴露标准 getter）。"]
-    lines = ["", "<b>交易解析信息</b>"]
+        return ["", "未解析到代币/时间字段（可能该合约未暴露标准 getter）。"]
+    lines = [""]
     if token_name:
-        lines.append(f"代币名称：<code>{html.escape(token_name)}</code>")
+        lines.append(f"代币名字：{html.escape(token_name)}")
     if token_address:
-        lines.append(f"代币合约：<code>{html.escape(token_address)}</code>")
+        addr_link = BSCSCAN_ADDRESS + token_address
+        lines.append(f"代币合约：<a href=\"{html.escape(addr_link)}\">{html.escape(token_address)}</a>")
+    if not token_address and not token_name:
+        lines.append("代币信息：未解析到")
     if start_ts:
-        lines.append(f"开始时间：<code>{html.escape(_fmt_unix(start_ts))}</code>")
+        lines.append(f"开始时间：{html.escape(_fmt_ts_short(start_ts))}")
     if end_ts:
-        lines.append(f"结束时间：<code>{html.escape(_fmt_unix(end_ts))}</code>")
+        lines.append(f"结束时间：{html.escape(_fmt_ts_short(end_ts))}")
     if input_addresses:
         lines.append("")
         lines.append("<b>创建参数地址列表</b>")
         for idx, addr, name in input_addresses:
+            addr_link = BSCSCAN_ADDRESS + addr
             if name:
-                lines.append(f"#{idx}: <code>{html.escape(addr)}</code> — {html.escape(name)}")
+                lines.append(f"#{idx}: <a href=\"{html.escape(addr_link)}\">{html.escape(addr)}</a> — {html.escape(name)}")
             else:
-                lines.append(f"#{idx}: <code>{html.escape(addr)}</code>")
+                lines.append(f"#{idx}: <a href=\"{html.escape(addr_link)}\">{html.escape(addr)}</a>")
     return lines
 
 
@@ -909,36 +920,38 @@ def render_notify_message(
     input_addresses: Optional[List[Tuple[int, str, Optional[str]]]] = None,
 ) -> str:
     watcher_name = watcher.label or watcher.address
+    tx_link = BSCSCAN_TX + tx_hash
 
     lines = [
-        "<b>🔔 发现新的 IDO 合约</b>",
-        f"监控对象：<code>{html.escape(watcher_name)}</code>",
-        f"工厂地址：<code>{html.escape(watcher.address)}</code>",
-        f"新 IDO 合约：<code>{html.escape(ido_address)}</code>",
-        f"区块：<code>{block_number}</code>",
-        f"交易哈希：<code>{html.escape(tx_hash)}</code>",
+        f"<b>（{html.escape(watcher_name)}）部署新IDO合约</b>",
+        f"交易哈希：<a href=\"{html.escape(tx_link)}\">{html.escape(tx_hash)}</a>",
     ]
 
-    if token_address or token_name or start_ts or end_ts:
-        lines.append("")
-        lines.append("<b>IDO 关键信息（从创建交易解析）</b>")
-        if token_name:
-            lines.append(f"代币名称：<code>{html.escape(token_name)}</code>")
-        if token_address:
-            lines.append(f"代币合约：<code>{html.escape(token_address)}</code>")
-        if start_ts:
-            lines.append(f"开始时间：<code>{html.escape(_fmt_unix(start_ts))}</code>")
-        if end_ts:
-            lines.append(f"结束时间：<code>{html.escape(_fmt_unix(end_ts))}</code>")
+    if token_name:
+        lines.append(f"代币名字：{html.escape(token_name)}")
+    if token_address:
+        addr_link = BSCSCAN_ADDRESS + token_address
+        lines.append(f"代币合约：<a href=\"{html.escape(addr_link)}\">{html.escape(token_address)}</a>")
+    if start_ts:
+        lines.append(f"开始时间：{html.escape(_fmt_ts_short(start_ts))}")
+    if end_ts:
+        lines.append(f"结束时间：{html.escape(_fmt_ts_short(end_ts))}")
+
+    # 没有解析到代币信息时显示提示
+    if not token_address and not token_name:
+        lines.append("代币信息：未解析到")
+
+    lines.append(f"IDO 合约：<a href=\"{html.escape(BSCSCAN_ADDRESS + ido_address)}\">{html.escape(ido_address)}</a>")
 
     if input_addresses:
         lines.append("")
         lines.append("<b>创建参数地址列表</b>")
         for idx, addr, name in input_addresses:
+            addr_link = BSCSCAN_ADDRESS + addr
             if name:
-                lines.append(f"#{idx}: <code>{html.escape(addr)}</code> — {html.escape(name)}")
+                lines.append(f"#{idx}: <a href=\"{html.escape(addr_link)}\">{html.escape(addr)}</a> — {html.escape(name)}")
             else:
-                lines.append(f"#{idx}: <code>{html.escape(addr)}</code>")
+                lines.append(f"#{idx}: <a href=\"{html.escape(addr_link)}\">{html.escape(addr)}</a>")
 
     if ownership_changes:
         lines.append("")
@@ -948,9 +961,6 @@ def render_notify_message(
                 f"{i}. <code>{html.escape(prev_owner)}</code> → <code>{html.escape(new_owner)}</code>"
             )
 
-    lines.append("")
-    lines.append(f"<a href=\"{html.escape(BSCSCAN_ADDRESS + ido_address)}\">查看合约</a>")
-    lines.append(f"<a href=\"{html.escape(BSCSCAN_TX + tx_hash)}\">查看交易</a>")
     return "\n".join(lines)
 
 
