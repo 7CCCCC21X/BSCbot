@@ -831,11 +831,11 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
         )
 
     tx_link = BSCSCAN_TX + tx_hash
-    group_line = f"加入<a href=\"{html.escape(GROUP_LINK)}\">{html.escape(GROUP_NAME)}</a> 获取最新打新消息"
+    group_line = f"加入<a href=\"{html.escape(GROUP_LINK)}\">{html.escape(GROUP_NAME)}</a> 获取最新消息"
 
     if matched_lines:
-        # 找到第一个命中的 watcher 名称
-        first_watcher_name = None
+        # 找到第一个命中的 watcher 备注
+        first_watcher_label = None
         for lg in logs:
             topics = lg.get("topics", [])
             if not topics:
@@ -844,19 +844,25 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
                 continue
             emitter = str(lg["address"]).lower()
             w = watcher_map.get(emitter)
-            if w:
-                first_watcher_name = w.label or w.address
+            if w and w.label:
+                first_watcher_label = w.label
                 break
 
-        label = html.escape(first_watcher_name or "未知")
         token_name_safe = html.escape(token_name) if token_name else None
         token_addr_safe = html.escape(token_address) if token_address else None
         start_str = html.escape(_fmt_ts_short(start_ts)) if start_ts else None
         end_str = html.escape(_fmt_ts_short(end_ts)) if end_ts else None
         tx_link_safe = html.escape(tx_link)
 
+        if first_watcher_label:
+            cn_title = f"<b>{html.escape(first_watcher_label)}  部署新的IDO合约</b>"
+            en_title = f"<b>{html.escape(first_watcher_label)}  New IDO Contract Deployed</b>"
+        else:
+            cn_title = "<b>部署新的IDO合约</b>"
+            en_title = "<b>New IDO Contract Deployed</b>"
+
         # 中文
-        cn = [f"<b>{label}  部署新的IDO合约</b>"]
+        cn = [cn_title]
         if token_name_safe:
             cn.append(f"代币名称：{token_name_safe}")
         if token_addr_safe:
@@ -871,7 +877,7 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
         cn.append(f"TX：{tx_link_safe}")
 
         # English
-        en = [f"<b>{label}  New IDO Contract Deployed</b>"]
+        en = [en_title]
         if token_name_safe:
             en.append(f"Token Name: {token_name_safe}")
         if token_addr_safe:
@@ -975,9 +981,8 @@ def render_notify_message(
     input_addresses: Optional[List[Tuple[int, str, Optional[str]]]] = None,
 ) -> str:
     """返回中英双语通知消息。"""
-    watcher_name = watcher.label or watcher.address
     tx_link = BSCSCAN_TX + tx_hash
-    group_line = f"加入<a href=\"{html.escape(GROUP_LINK)}\">{html.escape(GROUP_NAME)}</a> 获取最新打新消息"
+    group_line = f"加入<a href=\"{html.escape(GROUP_LINK)}\">{html.escape(GROUP_NAME)}</a> 获取最新消息"
 
     token_name_safe = html.escape(token_name) if token_name else None
     token_addr_safe = html.escape(token_address) if token_address else None
@@ -985,8 +990,16 @@ def render_notify_message(
     end_str = html.escape(_fmt_ts_short(end_ts)) if end_ts else None
     tx_link_safe = html.escape(tx_link)
 
+    # 有备注才显示备注，没有备注只显示标题
+    if watcher.label:
+        cn_title = f"<b>{html.escape(watcher.label)}  部署新的IDO合约</b>"
+        en_title = f"<b>{html.escape(watcher.label)}  New IDO Contract Deployed</b>"
+    else:
+        cn_title = "<b>部署新的IDO合约</b>"
+        en_title = "<b>New IDO Contract Deployed</b>"
+
     # --- 中文 ---
-    cn = [f"<b>{html.escape(watcher_name)}  部署新的IDO合约</b>"]
+    cn = [cn_title]
     if token_name_safe:
         cn.append(f"代币名称：{token_name_safe}")
     if token_addr_safe:
@@ -1001,7 +1014,7 @@ def render_notify_message(
     cn.append(f"TX：{tx_link_safe}")
 
     # --- English ---
-    en = [f"<b>{html.escape(watcher_name)}  New IDO Contract Deployed</b>"]
+    en = [en_title]
     if token_name_safe:
         en.append(f"Token Name: {token_name_safe}")
     if token_addr_safe:
