@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 from web3 import Web3
@@ -828,13 +828,14 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
             f"  区块：<code>{block_number}</code>，logIndex：<code>{log_index}</code>"
         )
 
+    tx_link = BSCSCAN_TX + tx_hash
+
     if matched_lines:
         extra_lines = render_tx_extra_lines(token_address, token_name, start_ts, end_ts, show_when_empty=True, input_addresses=input_addresses)
         return True, (
-            "<b>✅ 该交易会被机器人命中</b>\n"
-            f"交易：<code>{html.escape(tx_hash)}</code>\n\n"
+            "<b>✅ 该交易会被机器人命中</b>\n\n"
             + "\n".join(matched_lines + extra_lines)
-            + f"\n\n<a href=\"{html.escape(BSCSCAN_TX + tx_hash)}\">打开 BscScan 交易</a>"
+            + f"\n\nTX：{html.escape(tx_link)}"
         )
 
     watcher_addr_list = "\n".join(
@@ -848,10 +849,9 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
             "\n".join(
                 [
                     "<b>❌ 该交易不会被当前机器人命中</b>",
-                    f"交易：<code>{html.escape(tx_hash)}</code>",
                     "原因：交易日志里未发现 <code>NewIDOContract(address)</code> 事件。",
                     *extra_lines,
-                    f"<a href=\"{html.escape(BSCSCAN_TX + tx_hash)}\">打开 BscScan 交易</a>",
+                    f"\nTX：{html.escape(tx_link)}",
                     "",
                     "<b>当前聊天监控地址（前20个）</b>",
                     watcher_addr_list,
@@ -865,10 +865,9 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
         "\n".join(
             [
                 "<b>❌ 该交易不会被当前聊天命中</b>",
-                f"交易：<code>{html.escape(tx_hash)}</code>",
                 "原因：虽然交易里有 <code>NewIDOContract(address)</code>，但发事件的地址不在当前聊天监控列表中。",
                 *extra_lines,
-                f"<a href=\"{html.escape(BSCSCAN_TX + tx_hash)}\">打开 BscScan 交易</a>",
+                f"\nTX：{html.escape(tx_link)}",
                 "",
                 "<b>当前聊天监控地址（前20个）</b>",
                 watcher_addr_list,
@@ -923,43 +922,23 @@ def render_notify_message(
     tx_link = BSCSCAN_TX + tx_hash
 
     lines = [
-        f"<b>（{html.escape(watcher_name)}）部署新IDO合约</b>",
-        f"交易哈希：<a href=\"{html.escape(tx_link)}\">{html.escape(tx_hash)}</a>",
+        f"<b>{html.escape(watcher_name)}  部署新的IDO合约</b>",
     ]
 
     if token_name:
-        lines.append(f"代币名字：{html.escape(token_name)}")
+        lines.append(f"代币名称：{html.escape(token_name)}")
     if token_address:
-        addr_link = BSCSCAN_ADDRESS + token_address
-        lines.append(f"代币合约：<a href=\"{html.escape(addr_link)}\">{html.escape(token_address)}</a>")
+        lines.append(f"代币合约：{html.escape(token_address)}")
     if start_ts:
         lines.append(f"开始时间：{html.escape(_fmt_ts_short(start_ts))}")
     if end_ts:
         lines.append(f"结束时间：{html.escape(_fmt_ts_short(end_ts))}")
 
-    # 没有解析到代币信息时显示提示
     if not token_address and not token_name:
         lines.append("代币信息：未解析到")
 
-    lines.append(f"IDO 合约：<a href=\"{html.escape(BSCSCAN_ADDRESS + ido_address)}\">{html.escape(ido_address)}</a>")
-
-    if input_addresses:
-        lines.append("")
-        lines.append("<b>创建参数地址列表</b>")
-        for idx, addr, name in input_addresses:
-            addr_link = BSCSCAN_ADDRESS + addr
-            if name:
-                lines.append(f"#{idx}: <a href=\"{html.escape(addr_link)}\">{html.escape(addr)}</a> — {html.escape(name)}")
-            else:
-                lines.append(f"#{idx}: <a href=\"{html.escape(addr_link)}\">{html.escape(addr)}</a>")
-
-    if ownership_changes:
-        lines.append("")
-        lines.append("<b>OwnershipTransferred</b>")
-        for i, (prev_owner, new_owner) in enumerate(ownership_changes, start=1):
-            lines.append(
-                f"{i}. <code>{html.escape(prev_owner)}</code> → <code>{html.escape(new_owner)}</code>"
-            )
+    lines.append("")
+    lines.append(f"TX：{html.escape(tx_link)}")
 
     return "\n".join(lines)
 
@@ -1497,8 +1476,25 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # =========================
 # 启动
 # =========================
+async def post_init(application: Application) -> None:
+    """启动时设置 Telegram 菜单命令列表。"""
+    await application.bot.set_my_commands([
+        BotCommand("help", "显示帮助"),
+        BotCommand("add", "添加监控地址"),
+        BotCommand("import", "批量导入地址"),
+        BotCommand("list", "查看监控列表"),
+        BotCommand("del", "删除监控地址"),
+        BotCommand("pause", "暂停监控地址"),
+        BotCommand("resume", "恢复监控地址"),
+        BotCommand("checktx", "检查交易是否命中"),
+        BotCommand("debugtx", "调试交易解析"),
+        BotCommand("status", "查看机器人状态"),
+        BotCommand("chatid", "查看聊天 ID"),
+    ])
+
+
 def build_app() -> Application:
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
