@@ -429,6 +429,10 @@ def _call_uint_method(address: str, selector: str) -> Optional[int]:
         return None
 
 
+def _selector(signature: str) -> str:
+    return "0x" + Web3.keccak(text=signature).hex()[:8]
+
+
 def _extract_addresses_from_input(input_data: str) -> List[str]:
     if not input_data or input_data == "0x":
         return []
@@ -529,20 +533,28 @@ def extract_ido_extra_info(ido_address: str) -> Tuple[Optional[str], Optional[st
     end_ts: Optional[int] = None
 
     token_selectors = [
-        "0xfc0c546a",  # token()
-        "0xb33b96cc",  # saleToken()
-        "0xcef0a0ce",  # idoToken()
-        "0x1f1881f8",  # projectToken()
+        _selector("token()"),
+        _selector("saleToken()"),
+        _selector("idoToken()"),
+        _selector("projectToken()"),
+        _selector("tokenAddress()"),
+        _selector("saleTokenAddress()"),
+        _selector("lpToken()"),
+        _selector("raiseToken()"),
     ]
     start_selectors = [
-        "0x3f58c0d9",  # startTime()
-        "0x5ae401dc",  # startTimestamp()
-        "0x730f76c9",  # startAt()
+        _selector("startTime()"),
+        _selector("startTimestamp()"),
+        _selector("startAt()"),
+        _selector("startDate()"),
+        _selector("start()"),
     ]
     end_selectors = [
-        "0xefc81a8c",  # endTime()
-        "0x4f44f53d",  # endTimestamp()
-        "0x3f3f9ef3",  # endAt()
+        _selector("endTime()"),
+        _selector("endTimestamp()"),
+        _selector("endAt()"),
+        _selector("endDate()"),
+        _selector("end()"),
     ]
 
     for sel in token_selectors:
@@ -551,6 +563,12 @@ def extract_ido_extra_info(ido_address: str) -> Tuple[Optional[str], Optional[st
             break
     if token_address:
         token_name = _call_string_method(token_address, "0x06fdde03")
+    if not token_name:
+        # 有些 IDO 直接暴露名字字段
+        for sig in ("name()", "tokenName()", "projectName()"):
+            token_name = _call_string_method(ido_address, _selector(sig))
+            if token_name:
+                break
 
     for sel in start_selectors:
         start_ts = _call_uint_method(ido_address, sel)
@@ -585,9 +603,12 @@ def render_tx_extra_lines(
     token_name: Optional[str],
     start_ts: Optional[int],
     end_ts: Optional[int],
+    show_when_empty: bool = False,
 ) -> List[str]:
     if not (token_address or token_name or start_ts or end_ts):
-        return []
+        if not show_when_empty:
+            return []
+        return ["", "<b>交易解析信息</b>", "未解析到代币/时间字段（可能该合约未暴露标准 getter）。"]
     lines = ["", "<b>交易解析信息</b>"]
     if token_name:
         lines.append(f"代币名称：<code>{html.escape(token_name)}</code>")
@@ -638,7 +659,7 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
         )
 
     if matched_lines:
-        extra_lines = render_tx_extra_lines(token_address, token_name, start_ts, end_ts)
+        extra_lines = render_tx_extra_lines(token_address, token_name, start_ts, end_ts, show_when_empty=True)
         return True, (
             "<b>✅ 该交易会被机器人命中</b>\n"
             f"交易：<code>{html.escape(tx_hash)}</code>\n\n"
@@ -697,7 +718,7 @@ def help_text() -> str:
         "/add 地址 备注 - 添加一个监控地址\n"
         "/import - 批量导入多个地址\n"
         "/list - 查看当前聊天已添加的地址\n"
-        "/del 地址 - 删除一个监控地址\n"
+        "/del 地址 - 删除一个地址\n"
         "/pause 地址 - 暂停一个地址\n"
         "/resume 地址 - 恢复一个地址\n"
         "/checktx 交易哈希 - 检查某笔交易能否被当前聊天命中\n"
