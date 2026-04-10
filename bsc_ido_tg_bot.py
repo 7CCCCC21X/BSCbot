@@ -848,20 +848,44 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
                 first_watcher_name = w.label or w.address
                 break
 
-        label = first_watcher_name or "未知"
-        parts = [f"<b>{html.escape(label)}  部署新的IDO合约</b>"]
-        if token_name:
-            parts.append(f"代币名称：{html.escape(token_name)}")
-        if token_address:
-            parts.append(f"代币合约：{html.escape(token_address)}")
-        if start_ts:
-            parts.append(f"开始时间：{html.escape(_fmt_ts_short(start_ts))}")
-        if end_ts:
-            parts.append(f"结束时间：{html.escape(_fmt_ts_short(end_ts))}")
-        if not token_address and not token_name:
-            parts.append("代币信息：未解析到")
-        parts.append("")
-        parts.append(f"TX：{html.escape(tx_link)}")
+        label = html.escape(first_watcher_name or "未知")
+        token_name_safe = html.escape(token_name) if token_name else None
+        token_addr_safe = html.escape(token_address) if token_address else None
+        start_str = html.escape(_fmt_ts_short(start_ts)) if start_ts else None
+        end_str = html.escape(_fmt_ts_short(end_ts)) if end_ts else None
+        tx_link_safe = html.escape(tx_link)
+
+        # 中文
+        cn = [f"<b>{label}  部署新的IDO合约</b>"]
+        if token_name_safe:
+            cn.append(f"代币名称：{token_name_safe}")
+        if token_addr_safe:
+            cn.append(f"代币合约：{token_addr_safe}")
+        if start_str:
+            cn.append(f"开始时间：{start_str}")
+        if end_str:
+            cn.append(f"结束时间：{end_str}")
+        if not token_addr_safe and not token_name_safe:
+            cn.append("代币信息：未解析到")
+        cn.append("")
+        cn.append(f"TX：{tx_link_safe}")
+
+        # English
+        en = [f"<b>{label}  New IDO Contract Deployed</b>"]
+        if token_name_safe:
+            en.append(f"Token Name: {token_name_safe}")
+        if token_addr_safe:
+            en.append(f"Token Contract: {token_addr_safe}")
+        if start_str:
+            en.append(f"Start Time: {start_str}")
+        if end_str:
+            en.append(f"End Time: {end_str}")
+        if not token_addr_safe and not token_name_safe:
+            en.append("Token Info: Not detected")
+        en.append("")
+        en.append(f"TX: {tx_link_safe}")
+
+        parts = cn + ["", "———————————", ""] + en
         parts.append("")
         parts.append(group_line)
         return True, "\n".join(parts)
@@ -950,31 +974,52 @@ def render_notify_message(
     end_ts: Optional[int] = None,
     input_addresses: Optional[List[Tuple[int, str, Optional[str]]]] = None,
 ) -> str:
+    """返回中英双语通知消息。"""
     watcher_name = watcher.label or watcher.address
     tx_link = BSCSCAN_TX + tx_hash
+    group_line = f"加入<a href=\"{html.escape(GROUP_LINK)}\">{html.escape(GROUP_NAME)}</a> 获取最新打新消息"
 
-    lines = [
-        f"<b>{html.escape(watcher_name)}  部署新的IDO合约</b>",
-    ]
+    token_name_safe = html.escape(token_name) if token_name else None
+    token_addr_safe = html.escape(token_address) if token_address else None
+    start_str = html.escape(_fmt_ts_short(start_ts)) if start_ts else None
+    end_str = html.escape(_fmt_ts_short(end_ts)) if end_ts else None
+    tx_link_safe = html.escape(tx_link)
 
-    if token_name:
-        lines.append(f"代币名称：{html.escape(token_name)}")
-    if token_address:
-        lines.append(f"代币合约：{html.escape(token_address)}")
-    if start_ts:
-        lines.append(f"开始时间：{html.escape(_fmt_ts_short(start_ts))}")
-    if end_ts:
-        lines.append(f"结束时间：{html.escape(_fmt_ts_short(end_ts))}")
+    # --- 中文 ---
+    cn = [f"<b>{html.escape(watcher_name)}  部署新的IDO合约</b>"]
+    if token_name_safe:
+        cn.append(f"代币名称：{token_name_safe}")
+    if token_addr_safe:
+        cn.append(f"代币合约：{token_addr_safe}")
+    if start_str:
+        cn.append(f"开始时间：{start_str}")
+    if end_str:
+        cn.append(f"结束时间：{end_str}")
+    if not token_addr_safe and not token_name_safe:
+        cn.append("代币信息：未解析到")
+    cn.append("")
+    cn.append(f"TX：{tx_link_safe}")
 
-    if not token_address and not token_name:
-        lines.append("代币信息：未解析到")
+    # --- English ---
+    en = [f"<b>{html.escape(watcher_name)}  New IDO Contract Deployed</b>"]
+    if token_name_safe:
+        en.append(f"Token Name: {token_name_safe}")
+    if token_addr_safe:
+        en.append(f"Token Contract: {token_addr_safe}")
+    if start_str:
+        en.append(f"Start Time: {start_str}")
+    if end_str:
+        en.append(f"End Time: {end_str}")
+    if not token_addr_safe and not token_name_safe:
+        en.append("Token Info: Not detected")
+    en.append("")
+    en.append(f"TX: {tx_link_safe}")
 
-    lines.append("")
-    lines.append(f"TX：{html.escape(tx_link)}")
-    lines.append("")
-    lines.append(f"加入<a href=\"{html.escape(GROUP_LINK)}\">{html.escape(GROUP_NAME)}</a> 获取最新打新消息")
-
-    return "\n".join(lines)
+    # 合并
+    parts = cn + ["", "———————————", ""] + en
+    parts.append("")
+    parts.append(group_line)
+    return "\n".join(parts)
 
 
 # =========================
