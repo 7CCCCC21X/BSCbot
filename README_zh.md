@@ -6,23 +6,22 @@
 event NewIDOContract(address indexed idoAddress);
 ```
 
-一旦发现新 IDO 合约，就会把：
-- 工厂地址
-- 新 IDO 合约地址
-- 交易哈希
-- 区块号
-- 同交易里的 `OwnershipTransferred`
-
-一起推送到 Telegram。
+一旦发现新 IDO 合约，就会推送到 Telegram，包含：
+- 代币名称（自动从链上读取）
+- 代币合约地址
+- IDO 开始/结束时间
+- 交易哈希（BscScan 链接）
 
 ---
 
 ## 功能
 
-- 中文命令
-- 支持导入多个地址监控
-- 支持备注
-- 支持暂停 / 恢复
+- 自动解析代币名称、合约地址、开始/结束时间
+- 中文命令 + Telegram 菜单
+- 支持批量导入多个地址监控
+- 支持备注、暂停 / 恢复
+- `/checktx` 检查交易是否会被命中
+- `/debugtx` 调试交易解析过程
 - 使用 SQLite 保存监控列表
 - 适合部署到 Railway
 
@@ -65,6 +64,8 @@ CONFIRMATIONS=2
 BLOCK_CHUNK=200
 DEFAULT_LOOKBACK=0
 LOG_LEVEL=INFO
+GROUP_LINK=https://t.me/xiaoccaac
+GROUP_NAME=小C聊天群
 ```
 
 ### 4）挂载 Volume
@@ -99,16 +100,19 @@ python bsc_ido_tg_bot.py
 
 ## 机器人命令
 
-- `/start`
-- `/help`
-- `/chatid`
-- `/add 0x地址 备注`
-- `/import`
-- `/list`
-- `/del 0x地址`
-- `/pause 0x地址`
-- `/resume 0x地址`
-- `/status`
+| 命令 | 说明 |
+|------|------|
+| `/help` | 显示帮助 |
+| `/add 0x地址 备注` | 添加监控地址 |
+| `/import` | 批量导入地址 |
+| `/list` | 查看监控列表 |
+| `/del 0x地址` | 删除监控地址 |
+| `/pause 0x地址` | 暂停监控 |
+| `/resume 0x地址` | 恢复监控 |
+| `/checktx 0x哈希` | 检查交易是否命中 |
+| `/debugtx 0x哈希` | 调试交易解析 |
+| `/status` | 查看机器人状态 |
+| `/chatid` | 查看聊天 ID |
 
 ---
 

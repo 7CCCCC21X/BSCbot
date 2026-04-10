@@ -56,6 +56,8 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 BSCSCAN_TX = os.getenv("BSCSCAN_TX", "https://bscscan.com/tx/")
 BSCSCAN_ADDRESS = os.getenv("BSCSCAN_ADDRESS", "https://bscscan.com/address/")
+GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/xiaoccaac")
+GROUP_NAME = os.getenv("GROUP_NAME", "小C聊天群")
 
 # 事件签名
 NEW_IDO_EVENT = "NewIDOContract(address)"
@@ -829,14 +831,40 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
         )
 
     tx_link = BSCSCAN_TX + tx_hash
+    group_line = f"加入<a href=\"{html.escape(GROUP_LINK)}\">{html.escape(GROUP_NAME)}</a> 获取最新打新消息"
 
     if matched_lines:
-        extra_lines = render_tx_extra_lines(token_address, token_name, start_ts, end_ts, show_when_empty=True, input_addresses=input_addresses)
-        return True, (
-            "<b>✅ 该交易会被机器人命中</b>\n\n"
-            + "\n".join(matched_lines + extra_lines)
-            + f"\n\nTX：{html.escape(tx_link)}"
-        )
+        # 找到第一个命中的 watcher 名称
+        first_watcher_name = None
+        for lg in logs:
+            topics = lg.get("topics", [])
+            if not topics:
+                continue
+            if topics[0].hex().lower() != NEW_IDO_TOPIC.lower():
+                continue
+            emitter = str(lg["address"]).lower()
+            w = watcher_map.get(emitter)
+            if w:
+                first_watcher_name = w.label or w.address
+                break
+
+        label = first_watcher_name or "未知"
+        parts = [f"<b>{html.escape(label)}  部署新的IDO合约</b>"]
+        if token_name:
+            parts.append(f"代币名称：{html.escape(token_name)}")
+        if token_address:
+            parts.append(f"代币合约：{html.escape(token_address)}")
+        if start_ts:
+            parts.append(f"开始时间：{html.escape(_fmt_ts_short(start_ts))}")
+        if end_ts:
+            parts.append(f"结束时间：{html.escape(_fmt_ts_short(end_ts))}")
+        if not token_address and not token_name:
+            parts.append("代币信息：未解析到")
+        parts.append("")
+        parts.append(f"TX：{html.escape(tx_link)}")
+        parts.append("")
+        parts.append(group_line)
+        return True, "\n".join(parts)
 
     watcher_addr_list = "\n".join(
         f"- <code>{html.escape(w.address)}</code>（{'启用' if w.enabled else '暂停'}）" for w in watchers[:20]
@@ -855,6 +883,8 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
                     "",
                     "<b>当前聊天监控地址（前20个）</b>",
                     watcher_addr_list,
+                    "",
+                    group_line,
                 ]
             ),
         )
@@ -871,6 +901,8 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
                 "",
                 "<b>当前聊天监控地址（前20个）</b>",
                 watcher_addr_list,
+                "",
+                group_line,
             ]
         ),
     )
@@ -939,6 +971,8 @@ def render_notify_message(
 
     lines.append("")
     lines.append(f"TX：{html.escape(tx_link)}")
+    lines.append("")
+    lines.append(f"加入<a href=\"{html.escape(GROUP_LINK)}\">{html.escape(GROUP_NAME)}</a> 获取最新打新消息")
 
     return "\n".join(lines)
 
