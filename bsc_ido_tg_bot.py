@@ -59,6 +59,10 @@ BSCSCAN_ADDRESS = os.getenv("BSCSCAN_ADDRESS", "https://bscscan.com/address/")
 GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/xiaoccaac")
 GROUP_NAME = os.getenv("GROUP_NAME", "小C聊天群")
 
+# 白名单用户 ID（逗号分隔），为空则不限制
+_raw_whitelist = os.getenv("ALLOWED_USERS", "")
+ALLOWED_USERS: set[int] = {int(x.strip()) for x in _raw_whitelist.split(",") if x.strip()}
+
 # 事件签名
 NEW_IDO_EVENT = "NewIDOContract(address)"
 OWNERSHIP_TRANSFERRED_EVENT = "OwnershipTransferred(address,address)"
@@ -358,6 +362,13 @@ def set_admin_only(chat_id: int, enabled: bool) -> None:
             (chat_id, 1 if enabled else 0, 1 if enabled else 0),
         )
         conn.commit()
+
+
+def is_allowed_user(user_id: int) -> bool:
+    """白名单为空则放行所有人，否则只允许白名单用户。"""
+    if not ALLOWED_USERS:
+        return True
+    return user_id in ALLOWED_USERS
 
 
 async def check_admin(update: Update) -> bool:
@@ -1125,17 +1136,33 @@ def render_notify_message(
 # =========================
 # 命令处理
 # =========================
+async def _check_whitelist(update: Update) -> bool:
+    """检查白名单，不在白名单则忽略。返回 True 表示放行。"""
+    user = update.effective_user
+    if not user:
+        return False
+    if is_allowed_user(user.id):
+        return True
+    return False
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if update.message:
         await update.message.reply_text(help_text(), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if update.message:
         await update.message.reply_text(help_text(), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if update.message and update.effective_chat:
         await update.message.reply_text(
             f"当前 chat_id：<code>{update.effective_chat.id}</code>",
@@ -1144,6 +1171,8 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if not update.message or not update.effective_chat:
         return
     if not await check_admin(update):
@@ -1175,6 +1204,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if not update.message or not update.effective_chat:
         return
     if not await check_admin(update):
@@ -1197,6 +1228,8 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if not update.message or not update.effective_chat:
         return
 
@@ -1215,6 +1248,8 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if not update.message or not update.effective_chat:
         return
 
@@ -1233,6 +1268,8 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if not update.message or not update.effective_chat:
         return
 
@@ -1302,6 +1339,8 @@ def parse_import_payload(text: str) -> List[Tuple[str, str]]:
 
 
 async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if not update.message or not update.effective_chat:
         return
     if not await check_admin(update):
@@ -1346,6 +1385,8 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if not update.message:
         return
 
@@ -1365,6 +1406,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if not update.message or not update.effective_chat:
         return
     chat_id = update.effective_chat.id
@@ -1383,6 +1426,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if not update.message or not update.effective_chat:
         return
     chat = update.effective_chat
@@ -1420,6 +1465,8 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if not update.message or not update.effective_chat:
         return
     if not await check_admin(update):
@@ -1430,6 +1477,8 @@ async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_checktx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if not update.message or not update.effective_chat:
         return
 
@@ -1590,6 +1639,8 @@ def debug_tx_parsing(tx_hash: str) -> str:
 
 
 async def cmd_debugtx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
     if not update.message or not update.effective_chat:
         return
     if not context.args:
