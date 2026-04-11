@@ -165,6 +165,30 @@ def init_db() -> None:
             )
             """
         )
+        # IDO 历史记录表 —— 持久化每次检测到的 IDO 详情
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ido_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                watcher_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                factory_address TEXT NOT NULL,
+                ido_address TEXT NOT NULL,
+                tx_hash TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
+                log_index INTEGER NOT NULL,
+                token_address TEXT,
+                token_name TEXT,
+                start_ts INTEGER,
+                end_ts INTEGER,
+                detected_at INTEGER NOT NULL,
+                UNIQUE(watcher_id, tx_hash, log_index)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ido_history_chat ON ido_history(chat_id, detected_at DESC)"
+        )
         conn.commit()
 
 
@@ -329,6 +353,10 @@ def get_stats(chat_id: int) -> dict:
             "SELECT MIN(last_scanned_block) AS min_b, MAX(last_scanned_block) AS max_b FROM watchers WHERE chat_id = ? AND enabled = 1",
             (chat_id,),
         ).fetchone()
+        # ido_history 中该聊天的记录数
+        history_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM ido_history WHERE chat_id = ?", (chat_id,)
+        ).fetchone()["c"]
     return {
         "watcher_total": watcher_total,
         "watcher_enabled": watcher_enabled,
@@ -336,6 +364,7 @@ def get_stats(chat_id: int) -> dict:
         "total_events": total_events,
         "min_block": block_row["min_b"] or 0,
         "max_block": block_row["max_b"] or 0,
+        "history_count": history_count,
     }
 
 
@@ -348,6 +377,53 @@ def cleanup_old_events(days: int = 30) -> int:
         ).rowcount
         conn.commit()
     return orphan
+
+
+def save_ido_history(
+    watcher_id: int,
+    chat_id: int,
+    factory_address: str,
+    ido_address: str,
+    tx_hash: str,
+    block_number: int,
+    log_index: int,
+    token_address: Optional[str] = None,
+    token_name: Optional[str] = None,
+    start_ts: Optional[int] = None,
+    end_ts: Optional[int] = None,
+) -> None:
+    """持久化一条 IDO 检测记录。"""
+    with db_conn() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO ido_history
+                (watcher_id, chat_id, factory_address, ido_address, tx_hash,
+                 block_number, log_index, token_address, token_name, start_ts, end_ts, detected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                watcher_id, chat_id, factory_address, ido_address, tx_hash,
+                block_number, log_index, token_address, token_name, start_ts, end_ts, current_unix(),
+            ),
+        )
+        conn.commit()
+
+
+def get_ido_history(chat_id: int, limit: int = 20) -> List[dict]:
+    """获取指定聊天最近的 IDO 历史记录。"""
+    with db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT h.*, w.label AS watcher_label
+            FROM ido_history h
+            LEFT JOIN watchers w ON h.watcher_id = w.id
+            WHERE h.chat_id = ?
+            ORDER BY h.detected_at DESC
+            LIMIT ?
+            """,
+            (chat_id, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def is_admin_only(chat_id: int) -> bool:
@@ -1056,6 +1132,7 @@ def help_text() -> str:
         "/pause 地址 - 暂停一个地址\n"
         "/resume 地址 - 恢复一个地址\n"
         "/checktx 交易哈希 - 检查某笔交易能否被当前聊天命中\n"
+        "/history [N] - 查看最近 N 条 IDO 历史（默认10）\n"
         "/status - 查看机器人运行状态\n\n"
         "<b>批量导入格式</b>\n"
         "直接发送：\n"
@@ -1446,7 +1523,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"已检测 IDO：<code>{stats['ido_count']}</code>\n"
         f"最新区块：<code>{latest}</code>\n"
         f"扫描进度：<code>{stats['max_block']}</code>（落后 {lag} 块）\n"
-        f"历史记录：<code>{stats['total_events']}</code> 条",
+        f"历史记录：<code>{stats['total_events']}</code> 条\n"
+        f"IDO 存档：<code>{stats['history_count']}</code> 条（/history 查看详情）",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1505,6 +1583,55 @@ async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"⚠️ 清理失败：{html.escape(str(e)[:200])}")
         return
     await update.message.reply_text(f"✅ 清理完成，删除 {cleaned} 条孤儿记录。")
+
+
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_whitelist(update):
+        return
+    if not update.message or not update.effective_chat:
+        return
+
+    limit = 10
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 50))
+        except ValueError:
+            pass
+
+    records = get_ido_history(update.effective_chat.id, limit=limit)
+    if not records:
+        await update.message.reply_text("暂无 IDO 历史记录。")
+        return
+
+    lines = [f"<b>最近 {len(records)} 条 IDO 记录</b>"]
+    for i, r in enumerate(records, start=1):
+        label = html.escape(r.get("watcher_label") or "")
+        token = html.escape(r.get("token_name") or "未知")
+        ido_addr = html.escape(r["ido_address"])
+        tx_link = BSCSCAN_TX + r["tx_hash"]
+        dt = datetime.fromtimestamp(r["detected_at"], tz=timezone.utc).astimezone(
+            timezone(timedelta(hours=8))
+        )
+        time_str = f"{dt:%Y-%m-%d %H:%M:%S}"
+        entry = f"{i}. "
+        if label:
+            entry += f"<b>{label}</b> | "
+        entry += f"代币：{token}\n"
+        entry += f"   IDO：<code>{ido_addr}</code>\n"
+        entry += f"   TX：<a href=\"{html.escape(tx_link)}\">{html.escape(r['tx_hash'][:18])}...</a>\n"
+        entry += f"   时间：{html.escape(time_str)} UTC+8"
+        lines.append(entry)
+
+    text = "\n\n".join(lines)
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            await update.message.reply_text(
+                text[i:i + 4000],
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+    else:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 async def cmd_checktx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1801,6 +1928,19 @@ async def scan_once(application: Application) -> None:
                         disable_web_page_preview=True,
                     )
                     mark_processed(watcher.id, tx_hash, log_index)
+                    save_ido_history(
+                        watcher_id=watcher.id,
+                        chat_id=watcher.chat_id,
+                        factory_address=watcher.address,
+                        ido_address=ido_address,
+                        tx_hash=tx_hash,
+                        block_number=block_number,
+                        log_index=log_index,
+                        token_address=token_address,
+                        token_name=token_name,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                    )
                     logger.info("发现新 IDO: factory=%s ido=%s tx=%s", watcher.address, ido_address, tx_hash)
                 except Exception as e:
                     logger.exception("处理日志失败 watcher=%s err=%s", watcher.address, e)
@@ -1827,6 +1967,7 @@ async def post_init(application: Application) -> None:
         BotCommand("pause", "暂停监控地址"),
         BotCommand("resume", "恢复监控地址"),
         BotCommand("checktx", "检查交易是否命中"),
+        BotCommand("history", "查看 IDO 历史记录"),
         BotCommand("stats", "查看统计信息"),
         BotCommand("admin", "管理员模式开关"),
         BotCommand("cleanup", "清理旧数据"),
@@ -1848,6 +1989,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("checktx", cmd_checktx))
+    app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("debugtx", cmd_debugtx))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("admin", cmd_admin))
