@@ -96,8 +96,10 @@ if not BSC_RPC_URL:
 ensure_parent_dir(DB_PATH)
 
 w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL, request_kwargs={"timeout": 30}))
-if not w3.is_connected():
-    raise RuntimeError("BSC RPC 连接失败，请检查 BSC_RPC_URL")
+if w3.is_connected():
+    logger.info("BSC RPC 连接成功: %s", BSC_RPC_URL)
+else:
+    logger.warning("BSC RPC 暂时无法连接，机器人将继续启动，RPC 恢复后自动工作: %s", BSC_RPC_URL)
 
 
 # =========================
