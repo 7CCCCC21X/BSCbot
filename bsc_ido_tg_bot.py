@@ -1191,7 +1191,13 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     label = " ".join(context.args[1:]).strip()
-    latest = await asyncio.to_thread(get_latest_block)
+    try:
+        latest = await asyncio.to_thread(get_latest_block)
+    except Exception as e:
+        logger.exception("cmd_add: 获取最新区块失败 err=%s", e)
+        await update.message.reply_text(f"⚠️ RPC 连接异常，无法获取最新区块：{html.escape(str(e)[:200])}")
+        return
+
     start_from = max(latest - CONFIRMATIONS - DEFAULT_LOOKBACK, 0)
     ok, msg = add_watcher(update.effective_chat.id, address, label, start_from)
     if ok:
@@ -1359,7 +1365,13 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    latest = await asyncio.to_thread(get_latest_block)
+    try:
+        latest = await asyncio.to_thread(get_latest_block)
+    except Exception as e:
+        logger.exception("cmd_import: 获取最新区块失败 err=%s", e)
+        await update.message.reply_text(f"⚠️ RPC 连接异常，无法获取最新区块：{html.escape(str(e)[:200])}")
+        return
+
     start_from = max(latest - CONFIRMATIONS - DEFAULT_LOOKBACK, 0)
 
     added = []
@@ -1390,7 +1402,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not update.message:
         return
 
-    latest = await asyncio.to_thread(get_latest_block)
+    try:
+        latest = await asyncio.to_thread(get_latest_block)
+    except Exception as e:
+        logger.exception("cmd_status: 获取最新区块失败 err=%s", e)
+        await update.message.reply_text(f"⚠️ RPC 连接异常，无法获取最新区块：{html.escape(str(e)[:200])}")
+        return
+
     count = enabled_count()
     await update.message.reply_text(
         "<b>机器人状态</b>\n"
@@ -1412,7 +1430,13 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     chat_id = update.effective_chat.id
     stats = get_stats(chat_id)
-    latest = await asyncio.to_thread(get_latest_block)
+    try:
+        latest = await asyncio.to_thread(get_latest_block)
+    except Exception as e:
+        logger.exception("cmd_stats: 获取最新区块失败 err=%s", e)
+        await update.message.reply_text(f"⚠️ RPC 连接异常，无法获取最新区块：{html.escape(str(e)[:200])}")
+        return
+
     lag = latest - stats["max_block"] if stats["max_block"] else 0
     await update.message.reply_text(
         "<b>统计信息</b>\n"
@@ -1472,7 +1496,12 @@ async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not await check_admin(update):
         await update.message.reply_text("仅管理员可执行此操作。")
         return
-    cleaned = await asyncio.to_thread(cleanup_old_events)
+    try:
+        cleaned = await asyncio.to_thread(cleanup_old_events)
+    except Exception as e:
+        logger.exception("cmd_cleanup: 清理失败 err=%s", e)
+        await update.message.reply_text(f"⚠️ 清理失败：{html.escape(str(e)[:200])}")
+        return
     await update.message.reply_text(f"✅ 清理完成，删除 {cleaned} 条孤儿记录。")
 
 
@@ -1680,7 +1709,12 @@ async def scan_once(application: Application) -> None:
     if not watchers:
         return
 
-    latest = await asyncio.to_thread(get_latest_block)
+    try:
+        latest = await asyncio.to_thread(get_latest_block)
+    except Exception as e:
+        logger.error("scan_once: 获取最新区块失败 err=%s", e)
+        return
+
     safe_latest = latest - CONFIRMATIONS
     if safe_latest < 0:
         return
