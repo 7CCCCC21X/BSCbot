@@ -473,6 +473,18 @@ def get_latest_block() -> int:
     return int(w3.eth.block_number)
 
 
+def is_contract_address(address: str) -> Optional[bool]:
+    """
+    判断地址是否是合约。
+    返回 True=合约，False=EOA（无 code），None=RPC 异常无法判断。
+    """
+    try:
+        code = w3.eth.get_code(checksum_address(address))
+    except Exception:
+        return None
+    return bool(code) and code != b"\x00"
+
+
 def get_logs_for_address(address: str, from_block: int, to_block: int) -> list:
     return w3.eth.get_logs(
         {
@@ -1278,12 +1290,39 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     start_from = max(latest - CONFIRMATIONS - DEFAULT_LOOKBACK, 0)
+
+    # 检测该地址是否为合约。监控对象应当是会发出 NewIDOContract 事件的工厂/部署器合约，
+    # 如果用户添加了 EOA（外部账号），事件是不会从 EOA 发出的，需要提醒。
+    is_contract = await asyncio.to_thread(is_contract_address, address)
+
     ok, msg = add_watcher(update.effective_chat.id, address, label, start_from)
     if ok:
-        await update.message.reply_text(
-            f"✅ 已添加监控\n地址：<code>{address}</code>\n备注：<code>{html.escape(label or '-')}</code>\n起扫区块：<code>{start_from}</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        lines = [
+            "✅ 已添加监控",
+            f"地址：<code>{address}</code>",
+            f"备注：<code>{html.escape(label or '-')}</code>",
+            f"起扫区块：<code>{start_from}</code>",
+        ]
+        if is_contract is False:
+            lines.extend(
+                [
+                    "",
+                    "⚠️ <b>警告：该地址疑似是 EOA（外部账号），不是合约</b>",
+                    "机器人只匹配 <code>NewIDOContract(address)</code> 事件的<b>发出者地址</b>，",
+                    "而 EOA 不会发出事件，通常不会被命中。",
+                    "请确认你要添加的是<b>工厂/部署器合约地址</b>（通常是交易的 To 地址），",
+                    "而不是部署者钱包（From 地址）。",
+                    "如确认无误可忽略此警告，或使用 /del 删除后重新添加正确地址。",
+                ]
+            )
+        elif is_contract is None:
+            lines.extend(
+                [
+                    "",
+                    "ℹ️ 无法通过 RPC 校验该地址是合约还是 EOA（网络异常），已按请求添加。",
+                ]
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     else:
         await update.message.reply_text(msg)
 
