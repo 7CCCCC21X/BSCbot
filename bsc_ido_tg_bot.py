@@ -991,6 +991,10 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
 
     matched_lines: List[str] = []
     new_ido_seen = 0
+    # 收集所有发出 NewIDOContract 的 emitter 地址（去重，保持首次出现顺序），
+    # 用于在未命中时建议用户 /add 正确的工厂合约地址。
+    unmatched_emitters: List[str] = []
+    _seen_emitters: set[str] = set()
 
     token_address, token_name, start_ts, end_ts, input_addresses = extract_tx_extra_info(tx_hash)
 
@@ -1002,6 +1006,12 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
             continue
         new_ido_seen += 1
         emitter = str(lg["address"]).lower()
+        if emitter not in _seen_emitters:
+            _seen_emitters.add(emitter)
+            try:
+                unmatched_emitters.append(checksum_address(emitter))
+            except Exception:
+                unmatched_emitters.append(emitter)
         watcher = watcher_map.get(emitter)
         if not watcher:
             continue
@@ -1108,6 +1118,20 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
         )
 
     extra_lines = render_tx_extra_lines(token_address, token_name, start_ts, end_ts, input_addresses=input_addresses)
+
+    # 仅展示未被监控的 emitter 地址，方便用户一眼看到要 /add 哪个。
+    missing_emitters = [a for a in unmatched_emitters if a.lower() not in watcher_map]
+    suggest_lines: List[str] = []
+    if missing_emitters:
+        suggest_lines.append("")
+        suggest_lines.append("<b>实际发出事件的合约地址（建议添加）</b>")
+        for addr in missing_emitters:
+            addr_link = BSCSCAN_ADDRESS + addr
+            suggest_lines.append(
+                f"- <a href=\"{html.escape(addr_link)}\">{html.escape(addr)}</a>\n"
+                f"  <code>/add {html.escape(addr)} 备注</code>"
+            )
+
     return (
         False,
         "\n".join(
@@ -1115,6 +1139,7 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
                 "<b>❌ 该交易不会被当前聊天命中</b>",
                 "原因：虽然交易里有 <code>NewIDOContract(address)</code>，但发事件的地址不在当前聊天监控列表中。",
                 *extra_lines,
+                *suggest_lines,
                 f"\nTX：{html.escape(tx_link)}",
                 "",
                 "<b>当前聊天监控地址（前20个）</b>",
