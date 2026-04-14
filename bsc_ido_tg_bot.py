@@ -26,10 +26,11 @@ import os
 import re
 import sqlite3
 import time
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from dotenv import load_dotenv
 from telegram import BotCommand, Update
@@ -72,6 +73,25 @@ OWNERSHIP_TRANSFERRED_TOPIC = Web3.keccak(text=OWNERSHIP_TRANSFERRED_EVENT).hex(
 
 ADDRESS_RE = re.compile(r"0x[a-fA-F0-9]{40}")
 TX_HASH_RE = re.compile(r"0x[a-fA-F0-9]{64}")
+
+# 中国时区（UTC+8），模块级常量避免在热路径反复构造
+CN_TZ = timezone(timedelta(hours=8))
+
+# Unix 时间戳合理区间（2017-01-01 ~ 2040-01-01），用于过滤 input 中偶然匹配的 uint
+VALID_TS_MIN = 1483228800
+VALID_TS_MAX = 2208988800
+
+# Telegram 单条消息最大安全长度（保留余量给 HTML 转义）
+TG_MSG_CHUNK = 4000
+
+# Token 元数据缓存设置
+_TOKEN_CACHE_MAX = 512
+_TOKEN_CACHE_TTL = 3600.0  # 秒
+
+# 安全上限：一笔交易 input 中最多探测多少个候选地址（防止极端 TX 打爆 RPC）
+MAX_INPUT_ADDRS = 20
+# _extract_addresses_from_input 的默认最大返回数
+EXTRACT_ADDR_DEFAULT_MAX = 32
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -590,64 +610,148 @@ def _decode_abi_uint(data_hex: str) -> Optional[int]:
         return None
 
 
-def _call_string_method(address: str, selector: str) -> Optional[str]:
+def _eth_call_raw(address: str, selector: str) -> Optional[str]:
+    """对目标合约执行一次只读调用，返回 hex 字符串；失败返回 None。
+
+    - Web3RPCError（节点返回错误，多数是 revert / 不存在的方法）记到 DEBUG，常见且可预期。
+    - 其它异常（网络 / 解析 / 校验）记到 DEBUG 同样不污染主日志。
+    """
     try:
         out = w3.eth.call({"to": checksum_address(address), "data": selector})
-        if isinstance(out, (bytes, bytearray)):
-            data_hex = "0x" + bytes(out).hex()
-        else:
-            data_hex = str(out)
-        return _decode_abi_string(data_hex)
-    except Exception:
+    except Web3RPCError as e:
+        logger.debug("eth_call RPC error addr=%s sel=%s err=%s", address, selector, e)
         return None
+    except Exception as e:
+        logger.debug("eth_call 异常 addr=%s sel=%s err=%s", address, selector, e)
+        return None
+    if isinstance(out, (bytes, bytearray)):
+        return "0x" + bytes(out).hex()
+    return str(out)
+
+
+def _call_string_method(address: str, selector: str) -> Optional[str]:
+    data_hex = _eth_call_raw(address, selector)
+    if data_hex is None:
+        return None
+    return _decode_abi_string(data_hex)
 
 
 def _call_address_method(address: str, selector: str) -> Optional[str]:
-    try:
-        out = w3.eth.call({"to": checksum_address(address), "data": selector})
-        if isinstance(out, (bytes, bytearray)):
-            data_hex = "0x" + bytes(out).hex()
-        else:
-            data_hex = str(out)
-        return _decode_abi_address(data_hex)
-    except Exception:
+    data_hex = _eth_call_raw(address, selector)
+    if data_hex is None:
         return None
+    return _decode_abi_address(data_hex)
 
 
 def _call_uint_method(address: str, selector: str) -> Optional[int]:
-    try:
-        out = w3.eth.call({"to": checksum_address(address), "data": selector})
-        if isinstance(out, (bytes, bytearray)):
-            data_hex = "0x" + bytes(out).hex()
-        else:
-            data_hex = str(out)
-        return _decode_abi_uint(data_hex)
-    except Exception:
+    data_hex = _eth_call_raw(address, selector)
+    if data_hex is None:
         return None
-
-
-def _is_probable_erc20(address: str) -> Tuple[bool, Optional[str]]:
-    # 返回：是否像 ERC20，和可读名称（优先 name，其次 symbol）
-    name = _call_string_method(address, _selector("name()"))
-    if name:
-        return True, name
-    symbol = _call_string_method(address, _selector("symbol()"))
-    if symbol:
-        return True, f"({symbol})"
-    decimals = _call_uint_method(address, _selector("decimals()"))
-    if decimals is not None and 0 <= decimals <= 36:
-        return True, None
-    total_supply = _call_uint_method(address, _selector("totalSupply()"))
-    if total_supply is not None:
-        return True, None
-    return False, None
+    return _decode_abi_uint(data_hex)
 
 
 def _selector(signature: str) -> str:
     return "0x" + Web3.keccak(text=signature).hex()[:8]
 
 
-def _extract_addresses_from_input(input_data: str) -> List[str]:
+# 预计算常用 selector，避免热路径重复 keccak
+_SEL_NAME = _selector("name()")
+_SEL_SYMBOL = _selector("symbol()")
+_SEL_DECIMALS = _selector("decimals()")
+_SEL_TOTAL_SUPPLY = _selector("totalSupply()")
+
+_TOKEN_SELECTORS: Tuple[str, ...] = (
+    _selector("token()"),
+    _selector("saleToken()"),
+    _selector("idoToken()"),
+    _selector("projectToken()"),
+    _selector("tokenAddress()"),
+    _selector("saleTokenAddress()"),
+    _selector("lpToken()"),
+    _selector("raiseToken()"),
+)
+_START_SELECTORS: Tuple[str, ...] = (
+    _selector("startTime()"),
+    _selector("startTimestamp()"),
+    _selector("startAt()"),
+    _selector("startDate()"),
+    _selector("start()"),
+)
+_END_SELECTORS: Tuple[str, ...] = (
+    _selector("endTime()"),
+    _selector("endTimestamp()"),
+    _selector("endAt()"),
+    _selector("endDate()"),
+    _selector("end()"),
+)
+_IDO_NAME_SELECTORS: Tuple[str, ...] = (
+    _SEL_NAME,
+    _selector("tokenName()"),
+    _selector("projectName()"),
+)
+
+# Token 元数据缓存：lowercased address -> (expire_monotonic_ts, (is_erc20, readable_name))
+_token_metadata_cache: "OrderedDict[str, Tuple[float, Tuple[bool, Optional[str]]]]" = OrderedDict()
+
+
+def _token_cache_get(addr_lc: str) -> Optional[Tuple[bool, Optional[str]]]:
+    entry = _token_metadata_cache.get(addr_lc)
+    if entry is None:
+        return None
+    expire_at, value = entry
+    if expire_at < time.monotonic():
+        # 过期，删除
+        _token_metadata_cache.pop(addr_lc, None)
+        return None
+    # LRU：命中时刷新到末尾
+    _token_metadata_cache.move_to_end(addr_lc)
+    return value
+
+
+def _token_cache_put(addr_lc: str, value: Tuple[bool, Optional[str]]) -> None:
+    _token_metadata_cache[addr_lc] = (time.monotonic() + _TOKEN_CACHE_TTL, value)
+    _token_metadata_cache.move_to_end(addr_lc)
+    # 超出上限时淘汰最老的
+    while len(_token_metadata_cache) > _TOKEN_CACHE_MAX:
+        _token_metadata_cache.popitem(last=False)
+
+
+def _is_probable_erc20(address: str) -> Tuple[bool, Optional[str]]:
+    """返回：是否像 ERC20，和可读名称（优先 name，其次 symbol）。
+
+    结果带 LRU + TTL 缓存，避免对同一代币地址重复探测。
+    """
+    addr_lc = address.lower()
+    cached = _token_cache_get(addr_lc)
+    if cached is not None:
+        return cached
+
+    name = _call_string_method(address, _SEL_NAME)
+    if name:
+        result = (True, name)
+        _token_cache_put(addr_lc, result)
+        return result
+    symbol = _call_string_method(address, _SEL_SYMBOL)
+    if symbol:
+        result = (True, f"({symbol})")
+        _token_cache_put(addr_lc, result)
+        return result
+    decimals = _call_uint_method(address, _SEL_DECIMALS)
+    if decimals is not None and 0 <= decimals <= 36:
+        result = (True, None)
+        _token_cache_put(addr_lc, result)
+        return result
+    total_supply = _call_uint_method(address, _SEL_TOTAL_SUPPLY)
+    if total_supply is not None:
+        result = (True, None)
+        _token_cache_put(addr_lc, result)
+        return result
+    result = (False, None)
+    _token_cache_put(addr_lc, result)
+    return result
+
+
+def _extract_addresses_from_input(input_data: str, max_addrs: int = EXTRACT_ADDR_DEFAULT_MAX) -> List[str]:
     if not input_data or input_data == "0x":
         return []
     data = input_data[2:] if input_data.startswith("0x") else input_data
@@ -671,6 +775,8 @@ def _extract_addresses_from_input(input_data: str) -> List[str]:
         if low not in seen:
             seen.add(low)
             out.append(addr)
+            if len(out) >= max_addrs:
+                break
     return out
 
 
@@ -689,7 +795,7 @@ def _extract_timestamps_from_input(input_data: str) -> List[int]:
         except Exception:
             continue
         # 粗略过滤：2017-01-01 ~ 2040-01-01 的 unix 秒
-        if 1483228800 <= v <= 2208988800:
+        if VALID_TS_MIN <= v <= VALID_TS_MAX:
             out.append(v)
     return out
 
@@ -753,20 +859,19 @@ def _decode_create_ido_input(input_data: str) -> Tuple[List[str], List[int]]:
         except Exception:
             addrs.append(a)
 
-    ts = [x for x in raw_ts if 1483228800 <= x <= 2208988800]
+    ts = [x for x in raw_ts if VALID_TS_MIN <= x <= VALID_TS_MAX]
     return addrs, ts
 
 
 def _fmt_ts_short(ts: int) -> str:
     """格式化时间戳为简洁格式：YYYY-MM-DD HH:MM:SS UTC+8"""
-    dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
-    dt_cn = dt_utc.astimezone(timezone(timedelta(hours=8)))
+    dt_cn = datetime.fromtimestamp(ts, tz=CN_TZ)
     return f"{dt_cn:%Y-%m-%d %H:%M:%S} UTC+8"
 
 
 def _fmt_unix(ts: int) -> str:
     dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
-    dt_cn = dt_utc.astimezone(timezone(timedelta(hours=8)))
+    dt_cn = dt_utc.astimezone(CN_TZ)
     return f"{ts} (UTC+8 {dt_cn:%Y-%m-%d %H:%M:%S}, UTC {dt_utc:%Y-%m-%d %H:%M:%S})"
 
 
@@ -810,7 +915,7 @@ def extract_tx_extra_info(
                     token_name = readable_name
             else:
                 # 非 ERC20 合约也尝试获取 name() 用于显示
-                name = _call_string_method(addr, _selector("name()"))
+                name = _call_string_method(addr, _SEL_NAME)
                 input_addresses.append((i, addr, name))
 
         # 如果没找到 ERC20，使用第一个非零地址作为兜底
@@ -824,6 +929,9 @@ def extract_tx_extra_info(
         first_contract_candidate: Optional[str] = None
         fallback_idx = 0
         for addr in _extract_addresses_from_input(input_data):
+            # 硬上限：防止极端 TX 让我们对几十个地址各打 5 次 RPC
+            if len(input_addresses) >= MAX_INPUT_ADDRS:
+                break
             if addr.lower() in {tx_from, tx_to}:
                 continue
             try:
@@ -865,52 +973,27 @@ def extract_ido_extra_info(ido_address: str) -> Tuple[Optional[str], Optional[st
     start_ts: Optional[int] = None
     end_ts: Optional[int] = None
 
-    token_selectors = [
-        _selector("token()"),
-        _selector("saleToken()"),
-        _selector("idoToken()"),
-        _selector("projectToken()"),
-        _selector("tokenAddress()"),
-        _selector("saleTokenAddress()"),
-        _selector("lpToken()"),
-        _selector("raiseToken()"),
-    ]
-    start_selectors = [
-        _selector("startTime()"),
-        _selector("startTimestamp()"),
-        _selector("startAt()"),
-        _selector("startDate()"),
-        _selector("start()"),
-    ]
-    end_selectors = [
-        _selector("endTime()"),
-        _selector("endTimestamp()"),
-        _selector("endAt()"),
-        _selector("endDate()"),
-        _selector("end()"),
-    ]
-
-    for sel in token_selectors:
+    for sel in _TOKEN_SELECTORS:
         token_address = _call_address_method(ido_address, sel)
         if token_address:
             break
     if token_address:
-        token_name = _call_string_method(token_address, "0x06fdde03")
+        token_name = _call_string_method(token_address, _SEL_NAME)
     if not token_name:
         # 有些 IDO 直接暴露名字字段
-        for sig in ("name()", "tokenName()", "projectName()"):
-            token_name = _call_string_method(ido_address, _selector(sig))
+        for sel in _IDO_NAME_SELECTORS:
+            token_name = _call_string_method(ido_address, sel)
             if token_name:
                 break
 
-    for sel in start_selectors:
+    for sel in _START_SELECTORS:
         start_ts = _call_uint_method(ido_address, sel)
-        if start_ts and 1483228800 <= start_ts <= 2208988800:
+        if start_ts and VALID_TS_MIN <= start_ts <= VALID_TS_MAX:
             break
         start_ts = None
-    for sel in end_selectors:
+    for sel in _END_SELECTORS:
         end_ts = _call_uint_method(ido_address, sel)
-        if end_ts and 1483228800 <= end_ts <= 2208988800:
+        if end_ts and VALID_TS_MIN <= end_ts <= VALID_TS_MAX:
             break
         end_ts = None
 
@@ -928,6 +1011,60 @@ def merge_extra_info(
         p_token_name or f_token_name,
         p_start or f_start,
         p_end or f_end,
+    )
+
+
+@dataclass
+class IDODetails:
+    """一条 IDO 日志的完整解析结果，用于合并到主循环展示。"""
+    ownership_changes: List[Tuple[str, str]]
+    token_address: Optional[str]
+    token_name: Optional[str]
+    start_ts: Optional[int]
+    end_ts: Optional[int]
+    input_addresses: List[Tuple[int, str, Optional[str]]]
+
+
+def collect_ido_details(tx_hash: str, ido_address: str) -> IDODetails:
+    """在单个线程任务里串行完成 receipt / tx input / ido getter 三步 RPC。
+
+    相较于对每步分别 asyncio.to_thread，减少线程调度开销；且可共享 token 元数据缓存。
+    任何一步失败都只影响该步骤的字段，不会中断其他解析。
+    """
+    ownership_changes: List[Tuple[str, str]] = []
+    token_address: Optional[str] = None
+    token_name: Optional[str] = None
+    start_ts: Optional[int] = None
+    end_ts: Optional[int] = None
+    input_addresses: List[Tuple[int, str, Optional[str]]] = []
+
+    try:
+        receipt = get_receipt(tx_hash)
+        ownership_changes = parse_ownership_transfers_from_receipt(receipt, ido_address)
+    except Exception as e:
+        logger.warning("receipt 解析失败 tx=%s err=%s", tx_hash, e)
+
+    try:
+        token_address, token_name, start_ts, end_ts, input_addresses = extract_tx_extra_info(tx_hash)
+    except Exception as e:
+        logger.warning("tx input 解析失败 tx=%s err=%s", tx_hash, e)
+
+    try:
+        from_ido = extract_ido_extra_info(ido_address)
+        token_address, token_name, start_ts, end_ts = merge_extra_info(
+            (token_address, token_name, start_ts, end_ts),
+            from_ido,
+        )
+    except Exception as e:
+        logger.warning("ido getter 解析失败 ido=%s tx=%s err=%s", ido_address, tx_hash, e)
+
+    return IDODetails(
+        ownership_changes=ownership_changes,
+        token_address=token_address,
+        token_name=token_name,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        input_addresses=input_addresses,
     )
 
 
@@ -1223,6 +1360,33 @@ async def _check_whitelist(update: Update) -> bool:
     if is_allowed_user(user.id):
         return True
     return False
+
+
+async def send_chunked(
+    message: Any,
+    text: str,
+    *,
+    parse_mode: Optional[str] = ParseMode.HTML,
+    disable_web_page_preview: bool = True,
+    chunk_size: int = TG_MSG_CHUNK,
+) -> None:
+    """将长消息按 chunk_size 切分后分段发送。
+
+    text 短于上限则一次发送；超出则按固定长度切块。所有块共享相同的 parse_mode 与预览设置。
+    """
+    if len(text) <= chunk_size:
+        await message.reply_text(
+            text,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+        return
+    for i in range(0, len(text), chunk_size):
+        await message.reply_text(
+            text[i:i + chunk_size],
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1609,9 +1773,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         token = html.escape(r.get("token_name") or "未知")
         ido_addr = html.escape(r["ido_address"])
         tx_link = BSCSCAN_TX + r["tx_hash"]
-        dt = datetime.fromtimestamp(r["detected_at"], tz=timezone.utc).astimezone(
-            timezone(timedelta(hours=8))
-        )
+        dt = datetime.fromtimestamp(r["detected_at"], tz=CN_TZ)
         time_str = f"{dt:%Y-%m-%d %H:%M:%S}"
         entry = f"{i}. "
         if label:
@@ -1623,15 +1785,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lines.append(entry)
 
     text = "\n\n".join(lines)
-    if len(text) > 4000:
-        for i in range(0, len(text), 4000):
-            await update.message.reply_text(
-                text[i:i + 4000],
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-    else:
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await send_chunked(update.message, text)
 
 
 async def cmd_checktx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1745,7 +1899,7 @@ def debug_tx_parsing(tx_hash: str) -> str:
                 lines.append(f"    is_erc20: ❌ 异常 {html.escape(str(e)[:80])}")
             # 额外尝试 name()
             try:
-                name = _call_string_method(addr, _selector("name()"))
+                name = _call_string_method(addr, _SEL_NAME)
                 lines.append(f"    name(): <code>{html.escape(str(name))}</code>")
             except Exception as e:
                 lines.append(f"    name(): ❌ {html.escape(str(e)[:60])}")
@@ -1815,19 +1969,7 @@ async def cmd_debugtx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"调试失败：{e}")
         return
     # 分段发送，避免超长
-    if len(text) > 4000:
-        for i in range(0, len(text), 4000):
-            await update.message.reply_text(
-                text[i:i + 4000],
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-    else:
-        await update.message.reply_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+    await send_chunked(update.message, text)
 
 
 # =========================
@@ -1883,43 +2025,19 @@ async def scan_once(application: Application) -> None:
                     if is_processed(watcher.id, tx_hash, log_index):
                         continue
 
-                    ownership_changes: List[Tuple[str, str]] = []
-                    token_address: Optional[str] = None
-                    token_name: Optional[str] = None
-                    start_ts: Optional[int] = None
-                    end_ts: Optional[int] = None
-                    input_addresses: List[Tuple[int, str, Optional[str]]] = []
-                    try:
-                        receipt = await asyncio.to_thread(get_receipt, tx_hash)
-                        ownership_changes = parse_ownership_transfers_from_receipt(receipt, ido_address)
-                    except Exception as e:
-                        logger.warning("receipt 解析失败 tx=%s err=%s", tx_hash, e)
-                    try:
-                        token_address, token_name, start_ts, end_ts, input_addresses = await asyncio.to_thread(
-                            extract_tx_extra_info, tx_hash
-                        )
-                    except Exception as e:
-                        logger.warning("tx input 解析失败 tx=%s err=%s", tx_hash, e)
-                    try:
-                        from_ido = await asyncio.to_thread(extract_ido_extra_info, ido_address)
-                        token_address, token_name, start_ts, end_ts = merge_extra_info(
-                            (token_address, token_name, start_ts, end_ts),
-                            from_ido,
-                        )
-                    except Exception as e:
-                        logger.warning("ido getter 解析失败 ido=%s tx=%s err=%s", ido_address, tx_hash, e)
+                    details = await asyncio.to_thread(collect_ido_details, tx_hash, ido_address)
 
                     text = render_notify_message(
                         watcher=watcher,
                         ido_address=ido_address,
                         tx_hash=tx_hash,
                         block_number=block_number,
-                        ownership_changes=ownership_changes,
-                        token_address=token_address,
-                        token_name=token_name,
-                        start_ts=start_ts,
-                        end_ts=end_ts,
-                        input_addresses=input_addresses,
+                        ownership_changes=details.ownership_changes,
+                        token_address=details.token_address,
+                        token_name=details.token_name,
+                        start_ts=details.start_ts,
+                        end_ts=details.end_ts,
+                        input_addresses=details.input_addresses,
                     )
                     await application.bot.send_message(
                         chat_id=watcher.chat_id,
@@ -1936,10 +2054,10 @@ async def scan_once(application: Application) -> None:
                         tx_hash=tx_hash,
                         block_number=block_number,
                         log_index=log_index,
-                        token_address=token_address,
-                        token_name=token_name,
-                        start_ts=start_ts,
-                        end_ts=end_ts,
+                        token_address=details.token_address,
+                        token_name=details.token_name,
+                        start_ts=details.start_ts,
+                        end_ts=details.end_ts,
                     )
                     logger.info("发现新 IDO: factory=%s ido=%s tx=%s", watcher.address, ido_address, tx_hash)
                 except Exception as e:
