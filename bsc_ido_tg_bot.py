@@ -1258,19 +1258,24 @@ def help_text() -> str:
     return (
         "<b>BSC IDO 监控机器人</b>\n\n"
         "适用场景：监控多个工厂/部署器合约地址发出的 <code>NewIDOContract(address)</code> 事件。\n\n"
-        "<b>命令列表</b>\n"
-        "/start - 显示帮助\n"
-        "/help - 显示帮助\n"
+        "<b>常用命令</b>\n"
+        "/start、/help - 显示帮助\n"
         "/chatid - 查看当前聊天 ID\n"
         "/add 地址 备注 - 添加一个监控地址\n"
         "/import - 批量导入多个地址\n"
         "/list - 查看当前聊天已添加的地址\n"
         "/del 地址 - 删除一个地址\n"
         "/pause 地址 - 暂停一个地址\n"
-        "/resume 地址 - 恢复一个地址\n"
+        "/resume 地址 - 恢复一个地址\n\n"
+        "<b>查询与统计</b>\n"
         "/checktx 交易哈希 - 检查某笔交易能否被当前聊天命中\n"
-        "/history [N] - 查看最近 N 条 IDO 历史（默认10）\n"
+        "/debugtx 交易哈希 - 逐步调试交易 input 解析（排错用）\n"
+        "/history [N] - 查看最近 N 条 IDO 历史（默认10，上限50）\n"
+        "/stats - 查看当前聊天的统计信息\n"
         "/status - 查看机器人运行状态\n\n"
+        "<b>群管理</b>\n"
+        "/admin on|off - 开/关管理员模式（仅群管理员可 /add /del /import）\n"
+        "/cleanup - 清理数据库孤儿记录\n\n"
         "<b>批量导入格式</b>\n"
         "直接发送：\n"
         "<code>/import\n"
@@ -1280,6 +1285,72 @@ def help_text() -> str:
         "也支持单行逗号分隔：\n"
         "<code>/import 0x111...,0x222...,0x333...</code>"
     )
+
+
+# 双语通知消息的字段标签（冒号分隔符已内置，中文全角：英文半角+空格）
+_CN_LABELS = {
+    "title_no_label": "部署新的IDO合约",
+    "title_with_label": "{label}  部署新的IDO合约",
+    "token_name": "代币名称：",
+    "token_contract": "代币合约：",
+    "ido_contract": "IDO 合约：",
+    "start_time": "开始时间：",
+    "end_time": "结束时间：",
+    "block": "区块：",
+    "no_token_info": "代币信息：未解析到",
+    "tx": "TX：",
+}
+_EN_LABELS = {
+    "title_no_label": "New IDO Contract Deployed",
+    "title_with_label": "{label}  New IDO Contract Deployed",
+    "token_name": "Token Name: ",
+    "token_contract": "Token Contract: ",
+    "ido_contract": "IDO Contract: ",
+    "start_time": "Start Time: ",
+    "end_time": "End Time: ",
+    "block": "Block: ",
+    "no_token_info": "Token Info: Not detected",
+    "tx": "TX: ",
+}
+
+
+def _scan_addr_link(addr: str) -> str:
+    """返回 <a href=...>0xAbc...</a> 形式，失败则退化为纯文本。"""
+    return f"<a href=\"{html.escape(BSCSCAN_ADDRESS + addr)}\">{html.escape(addr)}</a>"
+
+
+def _render_notify_section(
+    labels: dict,
+    watcher_label: str,
+    token_name_safe: Optional[str],
+    token_addr_link: Optional[str],
+    ido_addr_link: str,
+    start_str: Optional[str],
+    end_str: Optional[str],
+    block_number: int,
+    tx_link_safe: str,
+) -> List[str]:
+    """按语言标签渲染单语通知段。token/ido 地址已是带链接的安全 HTML。"""
+    if watcher_label:
+        title_fmt = labels["title_with_label"].format(label=html.escape(watcher_label))
+    else:
+        title_fmt = labels["title_no_label"]
+    lines = [f"<b>{title_fmt}</b>"]
+    if token_name_safe:
+        lines.append(f"{labels['token_name']}{token_name_safe}")
+    if token_addr_link:
+        lines.append(f"{labels['token_contract']}{token_addr_link}")
+    lines.append(f"{labels['ido_contract']}{ido_addr_link}")
+    if start_str:
+        lines.append(f"{labels['start_time']}{start_str}")
+    if end_str:
+        lines.append(f"{labels['end_time']}{end_str}")
+    lines.append(f"{labels['block']}<code>{block_number}</code>")
+    if not token_addr_link and not token_name_safe:
+        lines.append(labels["no_token_info"])
+    lines.append("")
+    lines.append(f"{labels['tx']}{tx_link_safe}")
+    return lines
 
 
 def render_notify_message(
@@ -1294,58 +1365,55 @@ def render_notify_message(
     end_ts: Optional[int] = None,
     input_addresses: Optional[List[Tuple[int, str, Optional[str]]]] = None,
 ) -> str:
-    """返回中英双语通知消息。"""
-    tx_link = BSCSCAN_TX + tx_hash
-    group_line = f"加入<a href=\"{html.escape(GROUP_LINK)}\">{html.escape(GROUP_NAME)}</a> 获取最新消息"
+    """返回中英双语通知消息。
 
+    语言无关的字段（所有权转移、创建参数地址列表、群链接）在双语段之后共享输出，
+    避免重复；IDO 合约、token 合约均带 bscscan 链接。
+    """
+    tx_link_safe = html.escape(BSCSCAN_TX + tx_hash)
     token_name_safe = html.escape(token_name) if token_name else None
-    token_addr_safe = html.escape(token_address) if token_address else None
+    token_addr_link = _scan_addr_link(token_address) if token_address else None
+    ido_addr_link = _scan_addr_link(ido_address)
     start_str = html.escape(_fmt_ts_short(start_ts)) if start_ts else None
     end_str = html.escape(_fmt_ts_short(end_ts)) if end_ts else None
-    tx_link_safe = html.escape(tx_link)
 
-    # --- 中文 ---
-    if watcher.label:
-        cn_title = f"<b>{html.escape(watcher.label)}  部署新的IDO合约</b>"
-    else:
-        cn_title = "<b>部署新的IDO合约</b>"
-    cn = [cn_title]
-    if token_name_safe:
-        cn.append(f"代币名称：{token_name_safe}")
-    if token_addr_safe:
-        cn.append(f"代币合约：{token_addr_safe}")
-    if start_str:
-        cn.append(f"开始时间：{start_str}")
-    if end_str:
-        cn.append(f"结束时间：{end_str}")
-    if not token_addr_safe and not token_name_safe:
-        cn.append("代币信息：未解析到")
-    cn.append("")
-    cn.append(f"TX：{tx_link_safe}")
+    cn_lines = _render_notify_section(
+        _CN_LABELS, watcher.label, token_name_safe, token_addr_link,
+        ido_addr_link, start_str, end_str, block_number, tx_link_safe,
+    )
+    en_lines = _render_notify_section(
+        _EN_LABELS, watcher.label, token_name_safe, token_addr_link,
+        ido_addr_link, start_str, end_str, block_number, tx_link_safe,
+    )
 
-    # --- English ---
-    if watcher.label:
-        en_title = f"<b>{html.escape(watcher.label)}  New IDO Contract Deployed</b>"
-    else:
-        en_title = "<b>New IDO Contract Deployed</b>"
-    en = [en_title]
-    if token_name_safe:
-        en.append(f"Token Name: {token_name_safe}")
-    if token_addr_safe:
-        en.append(f"Token Contract: {token_addr_safe}")
-    if start_str:
-        en.append(f"Start Time: {start_str}")
-    if end_str:
-        en.append(f"End Time: {end_str}")
-    if not token_addr_safe and not token_name_safe:
-        en.append("Token Info: Not detected")
-    en.append("")
-    en.append(f"TX: {tx_link_safe}")
+    parts: List[str] = cn_lines + ["", "———————————", ""] + en_lines
 
-    # 合并
-    parts = cn + ["", "———————————", ""] + en
-    parts.append("")
-    parts.append(group_line)
+    # 所有权转移（语言无关，双语下方共享）
+    if ownership_changes:
+        parts.append("")
+        parts.append("<b>所有权转移 / Ownership Transfers</b>")
+        for prev, new in ownership_changes:
+            parts.append(
+                f"<code>{html.escape(prev)}</code> → <code>{html.escape(new)}</code>"
+            )
+
+    # 创建参数地址列表（同样共享，保留 bscscan 链接 + 可读名）
+    if input_addresses:
+        parts.append("")
+        parts.append("<b>创建参数地址 / Input Addresses</b>")
+        for idx, addr, name in input_addresses:
+            addr_link = _scan_addr_link(addr)
+            if name:
+                parts.append(f"#{idx}: {addr_link} — {html.escape(name)}")
+            else:
+                parts.append(f"#{idx}: {addr_link}")
+
+    # 群组链接仅在配置非空时输出
+    if GROUP_LINK:
+        parts.append("")
+        parts.append(
+            f"加入<a href=\"{html.escape(GROUP_LINK)}\">{html.escape(GROUP_NAME)}</a> 获取最新消息"
+        )
     return "\n".join(parts)
 
 
