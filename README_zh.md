@@ -58,7 +58,11 @@ event NewIDOContract(address indexed idoAddress);
 
 ```env
 BOT_TOKEN=你的TG机器人Token
+# 主用 BSC RPC（必填）。也可以在这里用逗号填多个，程序会把第一个当主用，其余当备用。
 BSC_RPC_URL=你的BSC RPC
+# 额外备用 RPC，逗号分隔（可选）。任一 RPC 失败时自动切换到下一个。
+# 例：BSC_RPC_URLS=https://bsc-dataseed1.binance.org,https://bsc-dataseed2.binance.org,https://bsc.publicnode.com
+BSC_RPC_URLS=
 DB_PATH=/data/watchers.db
 SCAN_INTERVAL=5
 CONFIRMATIONS=2

@@ -46,7 +46,10 @@ load_dotenv()
 # 配置
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+# 支持多个 RPC：BSC_RPC_URL（逗号分隔）+ BSC_RPC_URLS（逗号分隔）
+# 首个为主用，其余为备用。主用失败时自动切换到下一个。
 BSC_RPC_URL = os.getenv("BSC_RPC_URL", "")
+BSC_RPC_URLS_EXTRA = os.getenv("BSC_RPC_URLS", "")
 DB_PATH = os.getenv("DB_PATH", "watchers.db")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "5"))
 CONFIRMATIONS = int(os.getenv("CONFIRMATIONS", "2"))
@@ -90,16 +93,84 @@ def ensure_parent_dir(file_path: str) -> None:
 
 if not BOT_TOKEN:
     raise RuntimeError("缺少 BOT_TOKEN 环境变量")
-if not BSC_RPC_URL:
-    raise RuntimeError("缺少 BSC_RPC_URL 环境变量")
+
+
+def _parse_rpc_urls() -> List[str]:
+    urls: List[str] = []
+    seen: set[str] = set()
+    for raw in (BSC_RPC_URL, BSC_RPC_URLS_EXTRA):
+        for u in raw.split(","):
+            u = u.strip()
+            if not u:
+                continue
+            if u in seen:
+                continue
+            seen.add(u)
+            urls.append(u)
+    return urls
+
+
+RPC_URLS: List[str] = _parse_rpc_urls()
+if not RPC_URLS:
+    raise RuntimeError("缺少 BSC_RPC_URL / BSC_RPC_URLS 环境变量（至少配置一个 RPC）")
 
 ensure_parent_dir(DB_PATH)
 
-w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL, request_kwargs={"timeout": 30}))
-if w3.is_connected():
-    logger.info("BSC RPC 连接成功: %s", BSC_RPC_URL)
-else:
-    logger.warning("BSC RPC 暂时无法连接，机器人将继续启动，RPC 恢复后自动工作: %s", BSC_RPC_URL)
+_w3_clients: List[Web3] = [
+    Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 30})) for url in RPC_URLS
+]
+_active_rpc_idx: int = 0
+w3: Web3 = _w3_clients[_active_rpc_idx]
+
+for idx, client in enumerate(_w3_clients):
+    tag = "主用" if idx == 0 else f"备用#{idx}"
+    try:
+        ok = client.is_connected()
+    except Exception as e:
+        logger.warning("BSC RPC [%s] 连接检测异常 %s: %s", tag, RPC_URLS[idx], e)
+        continue
+    if ok:
+        logger.info("BSC RPC [%s] 连接成功: %s", tag, RPC_URLS[idx])
+    else:
+        logger.warning("BSC RPC [%s] 暂时无法连接: %s", tag, RPC_URLS[idx])
+
+
+def _switch_to_next_rpc(err: Optional[BaseException] = None) -> bool:
+    """把 w3 切到下一个备用 RPC。返回是否切换成功（存在不同的下一个 RPC）。"""
+    global _active_rpc_idx, w3
+    if len(_w3_clients) <= 1:
+        return False
+    prev_idx = _active_rpc_idx
+    _active_rpc_idx = (_active_rpc_idx + 1) % len(_w3_clients)
+    w3 = _w3_clients[_active_rpc_idx]
+    logger.warning(
+        "RPC 切换：%s → %s%s",
+        RPC_URLS[prev_idx],
+        RPC_URLS[_active_rpc_idx],
+        f"（原因：{err}）" if err is not None else "",
+    )
+    return True
+
+
+def _rpc_with_failover(fn):
+    """包装一个接受单个 Web3 客户端的函数，在失败时依次尝试其余备用 RPC。"""
+    def wrapper(*args, **kwargs):
+        last_err: Optional[BaseException] = None
+        for _ in range(len(_w3_clients)):
+            client = _w3_clients[_active_rpc_idx]
+            try:
+                return fn(client, *args, **kwargs)
+            except Exception as e:
+                last_err = e
+                if not _switch_to_next_rpc(e):
+                    break
+        assert last_err is not None
+        raise last_err
+    return wrapper
+
+
+def current_rpc_url() -> str:
+    return RPC_URLS[_active_rpc_idx]
 
 
 # =========================
@@ -469,12 +540,14 @@ async def check_admin(update: Update) -> bool:
 # =========================
 # 链上逻辑
 # =========================
-def get_latest_block() -> int:
-    return int(w3.eth.block_number)
+@_rpc_with_failover
+def get_latest_block(client: Web3) -> int:
+    return int(client.eth.block_number)
 
 
-def get_logs_for_address(address: str, from_block: int, to_block: int) -> list:
-    return w3.eth.get_logs(
+@_rpc_with_failover
+def get_logs_for_address(client: Web3, address: str, from_block: int, to_block: int) -> list:
+    return client.eth.get_logs(
         {
             "fromBlock": from_block,
             "toBlock": to_block,
@@ -484,23 +557,45 @@ def get_logs_for_address(address: str, from_block: int, to_block: int) -> list:
     )
 
 
-def get_receipt(tx_hash_hex: str):
-    return w3.eth.get_transaction_receipt(tx_hash_hex)
+@_rpc_with_failover
+def get_receipt(client: Web3, tx_hash_hex: str):
+    return client.eth.get_transaction_receipt(tx_hash_hex)
+
+
+@_rpc_with_failover
+def get_code(client: Web3, address: str):
+    return client.eth.get_code(checksum_address(address))
+
+
+@_rpc_with_failover
+def eth_call(client: Web3, tx: dict):
+    return client.eth.call(tx)
+
+
+@_rpc_with_failover
+def get_transaction(client: Web3, tx_hash: str):
+    return client.eth.get_transaction(tx_hash)
+
+
+@_rpc_with_failover
+def raw_rpc_request(client: Web3, method: str, params: list):
+    return client.provider.make_request(method, params)
 
 
 def _get_raw_transaction(tx_hash: str) -> Optional[dict]:
     """
-    当 w3.eth.get_transaction 因格式化错误（如 chainId 为空）失败时，
+    当 get_transaction 因格式化错误（如 chainId 为空）失败时，
     使用原始 RPC 调用绕过 web3.py 的结果格式化器。
+    所有访问均自带多 RPC 故障转移。
     """
     try:
-        return w3.eth.get_transaction(tx_hash)
+        return get_transaction(tx_hash)
     except Exception:
         pass
     # 兜底：直接发原始 JSON-RPC 请求
     try:
-        resp = w3.provider.make_request("eth_getTransactionByHash", [tx_hash])
-        result = resp.get("result")
+        resp = raw_rpc_request("eth_getTransactionByHash", [tx_hash])
+        result = resp.get("result") if isinstance(resp, dict) else None
         if result and isinstance(result, dict):
             return result
     except Exception:
@@ -592,7 +687,7 @@ def _decode_abi_uint(data_hex: str) -> Optional[int]:
 
 def _call_string_method(address: str, selector: str) -> Optional[str]:
     try:
-        out = w3.eth.call({"to": checksum_address(address), "data": selector})
+        out = eth_call({"to": checksum_address(address), "data": selector})
         if isinstance(out, (bytes, bytearray)):
             data_hex = "0x" + bytes(out).hex()
         else:
@@ -604,7 +699,7 @@ def _call_string_method(address: str, selector: str) -> Optional[str]:
 
 def _call_address_method(address: str, selector: str) -> Optional[str]:
     try:
-        out = w3.eth.call({"to": checksum_address(address), "data": selector})
+        out = eth_call({"to": checksum_address(address), "data": selector})
         if isinstance(out, (bytes, bytearray)):
             data_hex = "0x" + bytes(out).hex()
         else:
@@ -616,7 +711,7 @@ def _call_address_method(address: str, selector: str) -> Optional[str]:
 
 def _call_uint_method(address: str, selector: str) -> Optional[int]:
     try:
-        out = w3.eth.call({"to": checksum_address(address), "data": selector})
+        out = eth_call({"to": checksum_address(address), "data": selector})
         if isinstance(out, (bytes, bytearray)):
             data_hex = "0x" + bytes(out).hex()
         else:
@@ -827,7 +922,7 @@ def extract_tx_extra_info(
             if addr.lower() in {tx_from, tx_to}:
                 continue
             try:
-                code = w3.eth.get_code(addr)
+                code = get_code(addr)
             except Exception:
                 continue
             if not code:
@@ -1489,9 +1584,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     count = enabled_count()
+    rpc_lines = []
+    for idx, url in enumerate(RPC_URLS):
+        tag = "主用" if idx == 0 else f"备用#{idx}"
+        active = "（当前）" if idx == _active_rpc_idx else ""
+        rpc_lines.append(f"  {tag}{active}：<code>{html.escape(url)}</code>")
+    rpc_block = "\n".join(rpc_lines)
     await update.message.reply_text(
         "<b>机器人状态</b>\n"
-        f"RPC：<code>{html.escape(BSC_RPC_URL)}</code>\n"
+        f"RPC 列表（共 {len(RPC_URLS)} 个）：\n{rpc_block}\n"
         f"最新区块：<code>{latest}</code>\n"
         f"启用监控数量：<code>{count}</code>\n"
         f"扫描间隔：<code>{SCAN_INTERVAL}s</code>\n"
@@ -1670,14 +1771,14 @@ def debug_tx_parsing(tx_hash: str) -> str:
     # 1) 获取交易
     tx = None
     try:
-        tx = w3.eth.get_transaction(tx_hash)
+        tx = get_transaction(tx_hash)
         lines.append("\n✅ get_transaction 成功")
     except Exception as e:
         lines.append(f"\n⚠️ get_transaction 失败：{html.escape(str(e)[:100])}")
         lines.append("尝试原始 RPC 兜底...")
         try:
-            resp = w3.provider.make_request("eth_getTransactionByHash", [tx_hash])
-            tx = resp.get("result")
+            resp = raw_rpc_request("eth_getTransactionByHash", [tx_hash])
+            tx = resp.get("result") if isinstance(resp, dict) else None
             if tx and isinstance(tx, dict):
                 lines.append("✅ 原始 RPC 获取成功")
             else:
@@ -1729,7 +1830,7 @@ def debug_tx_parsing(tx_hash: str) -> str:
                 continue
             # get_code
             try:
-                code = w3.eth.get_code(addr)
+                code = get_code(addr)
                 has_code = bool(code and code != b"" and code != b"0x")
                 lines.append(f"[{i}] <code>{html.escape(addr)}</code>")
                 lines.append(f"    get_code: {'✅ 有代码' if has_code else '❌ 无代码'}（{len(code)} bytes）")
@@ -2007,7 +2108,7 @@ def main() -> None:
     cleaned = cleanup_old_events()
     if cleaned:
         logger.info("启动清理：删除 %d 条孤儿记录", cleaned)
-    logger.info("机器人启动中... RPC=%s", BSC_RPC_URL)
+    logger.info("机器人启动中... RPC 列表（共 %d 个）=%s", len(RPC_URLS), RPC_URLS)
     app = build_app()
     app.run_polling(drop_pending_updates=True)
 
