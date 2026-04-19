@@ -35,7 +35,8 @@ from dotenv import load_dotenv
 from telegram import BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
-from web3 import Web3
+from urllib.parse import urlparse, urlunparse
+from web3 import HTTPProvider, Web3
 from web3.exceptions import Web3RPCError
 
 # 允许本地通过 .env 启动；Railway 会直接注入环境变量
@@ -46,7 +47,10 @@ load_dotenv()
 # 配置
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-BSC_RPC_URL = os.getenv("BSC_RPC_URL", "")
+# BSC_RPC_URL 支持多个端点，用逗号 / 分号 / 换行分隔，按顺序做故障转移
+_RAW_RPC_URL = os.getenv("BSC_RPC_URL", "")
+BSC_RPC_URLS: List[str] = [u.strip() for u in re.split(r"[,\n;]+", _RAW_RPC_URL) if u.strip()]
+BSC_RPC_URL = BSC_RPC_URLS[0] if BSC_RPC_URLS else ""
 DB_PATH = os.getenv("DB_PATH", "watchers.db")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "5"))
 CONFIRMATIONS = int(os.getenv("CONFIRMATIONS", "2"))
@@ -90,16 +94,106 @@ def ensure_parent_dir(file_path: str) -> None:
 
 if not BOT_TOKEN:
     raise RuntimeError("缺少 BOT_TOKEN 环境变量")
-if not BSC_RPC_URL:
+if not BSC_RPC_URLS:
     raise RuntimeError("缺少 BSC_RPC_URL 环境变量")
 
 ensure_parent_dir(DB_PATH)
 
-w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL, request_kwargs={"timeout": 30}))
+
+def mask_rpc_url(url: str) -> str:
+    """遮蔽 RPC URL 中的 API key 段，仅保留前后少量字符用于展示/日志。"""
+    try:
+        parsed = urlparse(url)
+        path = parsed.path or ""
+        parts = path.strip("/").split("/")
+        if parts and len(parts[-1]) >= 12:
+            key = parts[-1]
+            parts[-1] = key[:4] + "***" + key[-4:]
+            return urlunparse(parsed._replace(path="/" + "/".join(parts)))
+        return url
+    except Exception:
+        return url
+
+
+class FailoverHTTPProvider(HTTPProvider):
+    """
+    按顺序轮询多个 RPC 端点的 HTTPProvider：
+    - 某个端点抛异常（401/超时/连接失败等）时，自动切到下一个
+    - 切换后粘住当前端点直到它再次失败，避免每次请求都重试失败的端点
+    - 记录每个端点的失败次数、最后一次错误，供 /status 展示
+    """
+
+    def __init__(self, endpoint_uris: Sequence[str], request_kwargs: Optional[dict] = None):
+        self._endpoint_uris: List[str] = list(endpoint_uris)
+        self._current_index: int = 0
+        self.failures: dict = {uri: 0 for uri in self._endpoint_uris}
+        self.successes: dict = {uri: 0 for uri in self._endpoint_uris}
+        self.last_errors: dict = {uri: "" for uri in self._endpoint_uris}
+        self.last_switch_ts: float = 0.0
+        self.switch_count: int = 0
+        super().__init__(self._endpoint_uris[0], request_kwargs=request_kwargs)
+
+    @property
+    def endpoint_uris(self) -> List[str]:
+        return list(self._endpoint_uris)
+
+    @property
+    def current_uri(self) -> str:
+        return self._endpoint_uris[self._current_index]
+
+    def make_request(self, method, params):
+        errors: List[Tuple[str, str]] = []
+        n = len(self._endpoint_uris)
+        start_index = self._current_index
+        for attempt in range(n):
+            idx = (start_index + attempt) % n
+            uri = self._endpoint_uris[idx]
+            self.endpoint_uri = uri
+            try:
+                resp = super().make_request(method, params)
+                self.successes[uri] = self.successes.get(uri, 0) + 1
+                if idx != start_index:
+                    old_uri = self._endpoint_uris[start_index]
+                    self._current_index = idx
+                    self.last_switch_ts = time.time()
+                    self.switch_count += 1
+                    logger.warning(
+                        "RPC 故障转移：%s -> %s", mask_rpc_url(old_uri), mask_rpc_url(uri)
+                    )
+                return resp
+            except Exception as e:
+                msg = str(e)[:200]
+                errors.append((uri, msg))
+                self.failures[uri] = self.failures.get(uri, 0) + 1
+                self.last_errors[uri] = msg
+                logger.warning(
+                    "RPC 请求失败 [%s] method=%s err=%s，尝试下一个",
+                    mask_rpc_url(uri),
+                    method,
+                    msg[:120],
+                )
+        # 全部失败：恢复指针、抛出聚合错误
+        self.endpoint_uri = self._endpoint_uris[start_index]
+        raise RuntimeError(
+            "所有 RPC 均不可用："
+            + "; ".join(f"{mask_rpc_url(u)}: {e}" for u, e in errors)
+        )
+
+
+rpc_provider = FailoverHTTPProvider(BSC_RPC_URLS, request_kwargs={"timeout": 30})
+w3 = Web3(rpc_provider)
 if w3.is_connected():
-    logger.info("BSC RPC 连接成功: %s", BSC_RPC_URL)
+    logger.info(
+        "BSC RPC 连接成功: %s（共 %d 个端点）",
+        mask_rpc_url(rpc_provider.current_uri),
+        len(BSC_RPC_URLS),
+    )
 else:
-    logger.warning("BSC RPC 暂时无法连接，机器人将继续启动，RPC 恢复后自动工作: %s", BSC_RPC_URL)
+    logger.warning(
+        "BSC RPC 暂时无法连接，机器人将继续启动，RPC 恢复后自动工作: %s（共 %d 个端点）",
+        mask_rpc_url(rpc_provider.current_uri),
+        len(BSC_RPC_URLS),
+    )
 
 
 # =========================
@@ -1489,15 +1583,46 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     count = enabled_count()
+
+    rpc_lines: List[str] = []
+    for i, uri in enumerate(rpc_provider.endpoint_uris):
+        is_current = i == rpc_provider._current_index
+        mark = "🟢" if is_current else "⚪"
+        fails = rpc_provider.failures.get(uri, 0)
+        succs = rpc_provider.successes.get(uri, 0)
+        line = (
+            f"{mark} <code>{html.escape(mask_rpc_url(uri))}</code>"
+            f"  成功 {succs} / 失败 {fails}"
+        )
+        last_err = rpc_provider.last_errors.get(uri, "")
+        if last_err and not is_current:
+            line += f"\n    ↳ 最近错误：<code>{html.escape(last_err[:120])}</code>"
+        rpc_lines.append(line)
+
+    switch_info = ""
+    if rpc_provider.switch_count:
+        last_switch = (
+            datetime.fromtimestamp(rpc_provider.last_switch_ts, tz=timezone.utc)
+            .astimezone()
+            .strftime("%Y-%m-%d %H:%M:%S")
+            if rpc_provider.last_switch_ts
+            else "-"
+        )
+        switch_info = (
+            f"RPC 切换次数：<code>{rpc_provider.switch_count}</code>（最近：{html.escape(last_switch)}）\n"
+        )
+
     await update.message.reply_text(
         "<b>机器人状态</b>\n"
-        f"RPC：<code>{html.escape(BSC_RPC_URL)}</code>\n"
         f"最新区块：<code>{latest}</code>\n"
         f"启用监控数量：<code>{count}</code>\n"
         f"扫描间隔：<code>{SCAN_INTERVAL}s</code>\n"
         f"确认块：<code>{CONFIRMATIONS}</code>\n"
         f"区块分片：<code>{BLOCK_CHUNK}</code>\n"
-        f"数据库：<code>{html.escape(DB_PATH)}</code>",
+        f"数据库：<code>{html.escape(DB_PATH)}</code>\n"
+        f"{switch_info}"
+        f"<b>RPC 端点（共 {len(rpc_provider.endpoint_uris)}）</b>\n"
+        + "\n".join(rpc_lines),
         parse_mode=ParseMode.HTML,
     )
 
@@ -2007,7 +2132,11 @@ def main() -> None:
     cleaned = cleanup_old_events()
     if cleaned:
         logger.info("启动清理：删除 %d 条孤儿记录", cleaned)
-    logger.info("机器人启动中... RPC=%s", BSC_RPC_URL)
+    logger.info(
+        "机器人启动中... RPC 端点 %d 个（当前：%s）",
+        len(BSC_RPC_URLS),
+        mask_rpc_url(rpc_provider.current_uri),
+    )
     app = build_app()
     app.run_polling(drop_pending_updates=True)
 

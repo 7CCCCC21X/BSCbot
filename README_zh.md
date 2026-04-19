@@ -58,7 +58,8 @@ event NewIDOContract(address indexed idoAddress);
 
 ```env
 BOT_TOKEN=你的TG机器人Token
-BSC_RPC_URL=你的BSC RPC
+# 支持多个 RPC，用英文逗号/分号/换行分隔，按顺序做故障转移
+BSC_RPC_URL=https://rpc1.example/key1,https://rpc2.example/key2
 DB_PATH=/data/watchers.db
 SCAN_INTERVAL=5
 CONFIRMATIONS=2
