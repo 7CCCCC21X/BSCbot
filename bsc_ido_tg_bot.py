@@ -58,6 +58,8 @@ BSCSCAN_TX = os.getenv("BSCSCAN_TX", "https://bscscan.com/tx/")
 BSCSCAN_ADDRESS = os.getenv("BSCSCAN_ADDRESS", "https://bscscan.com/address/")
 GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/xiaoc236")
 GROUP_NAME = os.getenv("GROUP_NAME", "小C聊天群")
+OKX_PROMO_TEXT = os.getenv("OKX_PROMO_TEXT", "OKX钱包 45%返佣开通联系")
+OKX_PROMO_CONTACT = os.getenv("OKX_PROMO_CONTACT", "@xiaoc888")
 
 # 白名单用户 ID（逗号分隔），为空则不限制
 _raw_whitelist = os.getenv("ALLOWED_USERS", "")
@@ -1007,6 +1009,7 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
 
     tx_link = BSCSCAN_TX + tx_hash
     group_line = f"加入<a href=\"{html.escape(GROUP_LINK)}\">{html.escape(GROUP_NAME)}</a> 获取最新消息"
+    okx_line = f"{html.escape(OKX_PROMO_TEXT)}{html.escape(OKX_PROMO_CONTACT)}"
 
     if matched_lines:
         # 找到第一个命中的 watcher 备注
@@ -1070,6 +1073,7 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
         parts = cn + ["", "———————————", ""] + en
         parts.append("")
         parts.append(group_line)
+        parts.append(okx_line)
         return True, "\n".join(parts)
 
     watcher_addr_list = "\n".join(
@@ -1091,6 +1095,7 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
                     watcher_addr_list,
                     "",
                     group_line,
+                    okx_line,
                 ]
             ),
         )
@@ -1109,6 +1114,7 @@ def analyze_tx_match_for_chat(chat_id: int, tx_hash: str) -> Tuple[bool, str]:
                 watcher_addr_list,
                 "",
                 group_line,
+                okx_line,
             ]
         ),
     )
@@ -1160,6 +1166,7 @@ def render_notify_message(
     """返回中英双语通知消息。"""
     tx_link = BSCSCAN_TX + tx_hash
     group_line = f"加入<a href=\"{html.escape(GROUP_LINK)}\">{html.escape(GROUP_NAME)}</a> 获取最新消息"
+    okx_line = f"{html.escape(OKX_PROMO_TEXT)}{html.escape(OKX_PROMO_CONTACT)}"
 
     token_name_safe = html.escape(token_name) if token_name else None
     token_addr_safe = html.escape(token_address) if token_address else None
@@ -1209,6 +1216,7 @@ def render_notify_message(
     parts = cn + ["", "———————————", ""] + en
     parts.append("")
     parts.append(group_line)
+    parts.append(okx_line)
     return "\n".join(parts)
 
 
