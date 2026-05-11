@@ -56,7 +56,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 BSCSCAN_TX = os.getenv("BSCSCAN_TX", "https://bscscan.com/tx/")
 BSCSCAN_ADDRESS = os.getenv("BSCSCAN_ADDRESS", "https://bscscan.com/address/")
-GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/xiaoccaac")
+GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/xiaoc236")
 GROUP_NAME = os.getenv("GROUP_NAME", "小C聊天群")
 
 # 白名单用户 ID（逗号分隔），为空则不限制
